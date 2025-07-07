@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -122,14 +123,12 @@ func ttlCheck() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	//create a buffer to hold the incoming data
-	buffer := make([]byte, 1024)
-
 	//read streamed data from the connection and keeps connection open for the client
 	//until the client closes the connection
 	for {
-		n, err := conn.Read(buffer)
-		fmt.Println(n)
+		//create a buffer (data) to hold the incoming information (read until newline)
+		data, err := bufio.NewReader(conn).ReadString('\n')
+		fmt.Println(len(data))
 		if err != nil {
 			if err == io.EOF {
 				fmt.Println("Client closed connection")
@@ -139,8 +138,6 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 		//process the received data
-		data := string(buffer[:n])
-
 		//trim leading and trailing whitespace and newlines from the data
 		data = strings.TrimSpace(data)
 
