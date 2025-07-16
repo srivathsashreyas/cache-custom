@@ -33,6 +33,8 @@ type LFUCache struct {
 	MinFreq int
 	//keep track of the max freq bucket
 	MaxFreq int
+	//track how many keys were evicted from the cache
+	Evictions uint64
 }
 
 func ConstructorLFU(capacity uint64) *LFUCache {
@@ -258,6 +260,9 @@ func (lfuCache *LFUCache) Put(key uint64, value string, clientKey string, ttlHea
 		deleteKeyHeap(ttlHeap, TTL{Key: lfu.Head.Key})
 
 		lfuCache.removeNode(lfu.Head.Frequency, lfu.Head)
+
+		//track how many keys were evicted from the cache
+		lfuCache.Evictions++
 	}
 
 	lfuCache.UsedMemory += entrySize(clientKey, value)
@@ -291,4 +296,10 @@ func (lfuCache *LFUCache) Delete(key uint64, ttlHeap *TTLHeap) {
 		deleteKeyHeap(ttlHeap, TTL{Key: key})
 	}
 	delete(lfuCache.Store, key)
+}
+
+//retrieve stats for the LRU cache
+func (lfuCache *LFUCache) Stats() (uint64, uint64, uint64) {
+	//return the used memory, max memory and number of evictions
+	return lfuCache.UsedMemory, lfuCache.MaxMemory, lfuCache.Evictions
 }

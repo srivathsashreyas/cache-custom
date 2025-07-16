@@ -23,6 +23,8 @@ type LRUCache struct {
 	KeyTail *LRUKV
 	//Keeps track of how much cache memory (bytes) has already been used
 	UsedMemory uint64
+	//track how many keys were evicted from the cache
+	Evictions uint64
 }
 
 func ConstructorLRU(capacity uint64) *LRUCache {
@@ -159,6 +161,8 @@ func (lruCache *LRUCache) Put(key uint64, value string, clientKey string, ttlHea
 		deleteKeyHeap(ttlHeap, TTL{Key: lru.Key})
 
 		lruCache.removeNode(lru)
+		//track how many keys were evicted from the cache
+		lruCache.Evictions++
 	}
 
 	lruCache.UsedMemory += entrySize(clientKey, value)
@@ -187,4 +191,10 @@ func (lruCache *LRUCache) Delete(key uint64, ttlHeap *TTLHeap) {
 		deleteKeyHeap(ttlHeap, TTL{Key: key})
 	}
 	delete(lruCache.Store, key)
+}
+
+//retrieve stats for the LRU cache
+func (lruCache *LRUCache) Stats() (uint64, uint64, uint64) {
+	//return the used memory, max memory and number of evictions
+	return lruCache.UsedMemory, lruCache.MaxMemory, lruCache.Evictions
 }

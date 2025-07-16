@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ type Cache interface {
 	Get(key uint64) string
 	Delete(key uint64, ttlHeap *TTLHeap)
 	Put(key uint64, value string, clientKey string, ttlHeap *TTLHeap, keyMap map[string]uint64) string
+	Stats() (uint64, uint64, uint64)
 }
 
 type AppCache struct {
@@ -62,11 +64,28 @@ var ticker *time.Ticker
 // map appId (tenantId) to AppCache
 var tenantCache map[uint64]*AppCache
 
+// baseline heap memory (at startup)
+var baselineAlloc uint64
+
 // retrieve the size of data (in bytes) to be inserted into the cache
 func entrySize(clientKey string, value string) uint64 {
 	//calculate the size of the entry in bytes
 	//size of the entry = size of clientKey + size of value
 	return uint64(len(clientKey)) + uint64(len(value))
+}
+
+// retrieve heap alloc information
+func readMemAlloc() uint64 {
+	//force garbage collection to collect memory that isn't referenced but not yet deallocated
+	//to ultimately get accurate memory usage statistics
+	runtime.GC()
+
+	//read memory stats from the runtime
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	//return heap alloc information
+	return m.Alloc
 }
 
 // retrieve the appropriate cache for a given tenant
@@ -176,25 +195,26 @@ func handleConnection(conn net.Conn) {
 		if len(cmd) > 0 {
 			//retrieve the cache key (uint64) from the client key (string) if it exists
 			//else 'create' a new cache key for the user provided key
-			if _, cacheHit = tenantCache[tenantId].KeyMap[clientKey]; cacheHit {
-				keyCache = tenantCache[tenantId].KeyMap[clientKey]
-			} else {
+			tenantCache[tenantId].Mu.Lock()
+			keyCache, cacheHit = tenantCache[tenantId].KeyMap[clientKey]
+			tenantCache[tenantId].Mu.Unlock()
+			if !cacheHit {
 				//if a cache key has been freed/deleted previously, use this key, set keyCache and remove it from freedKeys
 				//else set keyCache to the value of keyCounter and increment keyCounter
 				//lock the global mutex to ensure that freedKeys and keyCounter are accessed/modified in a thread-safe manner
 				gmu.Lock()
 				if len(freedKeys) > 0 {
-					tenantCache[tenantId].KeyMap[clientKey] = freedKeys[0]
 					keyCache = freedKeys[0]
 					freedKeys = freedKeys[1:]
 					usingFreedKey = true
-
 				} else {
-					tenantCache[tenantId].KeyMap[clientKey] = keyCounter
 					keyCache = keyCounter
 					keyCounter++
 				}
 				gmu.Unlock()
+				tenantCache[tenantId].Mu.Lock()
+				tenantCache[tenantId].KeyMap[clientKey] = keyCache
+				tenantCache[tenantId].Mu.Unlock()
 			}
 		}
 
@@ -299,6 +319,14 @@ func handleConnection(conn net.Conn) {
 
 				conn.Write([]byte(fmt.Sprintf("Key %s does not exist in cache\n", clientKey)))
 			}
+		case "STATS":
+			//return the stats for the cache
+			tenantCache[tenantId].Mu.Lock()
+			usedMemory, maxMemory, evictions := tcache.Stats()
+			tenantCache[tenantId].Mu.Unlock()
+			//calculate memory usage since the server started (all tenants)
+			memoryUsage := readMemAlloc() - baselineAlloc
+			conn.Write([]byte(fmt.Sprintf("Used Memory: %d bytes | Max Memory: %d bytes | Evictions: %d | Heap Usage(All Tenants): %d bytes\n", usedMemory, maxMemory, evictions, memoryUsage)))
 
 		default:
 			log.Printf("Unknown command: %s\n", cmd)
@@ -311,6 +339,10 @@ func handleConnection(conn net.Conn) {
 func main() {
 	//create tcp server
 	port := ":9001"
+
+	//find heap alloc baseline
+	baselineAlloc = readMemAlloc()
+
 	listener, err := net.Listen("tcp", port)
 
 	//if there is an error retrieving the listener, log it and exit
