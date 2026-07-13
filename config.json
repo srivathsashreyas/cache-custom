@@ -1,6 +1,7 @@
 [
   {
     "Name": "App1",
+    "Password": "secret1",
     "AppId": 1,
     "MaxMemory": 1048576,
     "Lru": true,
@@ -11,8 +12,9 @@
   },
   {
     "Name": "App2",
+    "Password": "secret2",
     "AppId": 2,
-    "MaxMemory": 1048576,
+    "MaxMemory": 65536,
     "Lru": false,
     "Lfu": true,
     "MaxTTL": 3600,

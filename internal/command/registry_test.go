@@ -9,7 +9,7 @@ import (
 
 func newTestRegistry() *Registry {
 	r := NewRegistry()
-	RegisterDefaults(r)
+	RegisterDefaults(r, nil)
 	return r
 }
 

@@ -16,7 +16,7 @@ import (
 func startGoRedisServer(t *testing.T) string {
 	t.Helper()
 	reg := command.NewRegistry()
-	command.RegisterDefaults(reg)
+	command.RegisterDefaults(reg, nil)
 	s := New("127.0.0.1:0", reg)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

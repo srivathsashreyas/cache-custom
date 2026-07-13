@@ -7,10 +7,12 @@ import (
 )
 
 // Config is one tenant entry in config.json.
-// M2 uses the first entry as the default RESP keyspace; M3 binds via AUTH.
 type Config struct {
-	Name   string
-	AppId  uint64
+	// Name is the AUTH username.
+	Name string
+	// Password is the AUTH secret (required).
+	Password string
+	AppId    uint64
 	// MaxMemory is the tenant memory budget in bytes.
 	MaxMemory uint64
 	Lru       bool
@@ -21,6 +23,8 @@ type Config struct {
 	ShardCount int
 	// ShardingStrategy: 1=global eviction track, 2=steal across shards, 3=per-shard budget.
 	ShardingStrategy int
+	// Disabled rejects AUTH for this tenant when true.
+	Disabled bool
 }
 
 func readConfig(path string) ([]Config, error) {
@@ -33,6 +37,12 @@ func readConfig(path string) ([]Config, error) {
 		return nil, err
 	}
 	for i := range configs {
+		if configs[i].Name == "" {
+			return nil, errors.New("each tenant requires Name")
+		}
+		if configs[i].Password == "" {
+			return nil, errors.New("each tenant requires Password")
+		}
 		if configs[i].Lru && configs[i].Lfu {
 			return nil, errors.New("only one caching policy can be set for a tenant")
 		}

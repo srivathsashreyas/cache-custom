@@ -8,13 +8,8 @@ import (
 	"sync"
 
 	"cache-custom/internal/protocol"
+	"cache-custom/internal/tenant"
 )
-
-// Context carries per-connection state for handlers.
-type Context struct {
-	// Quit is set by handlers that should close the connection after the reply.
-	Quit bool
-}
 
 // Handler executes a command. args[0] is the command name.
 type Handler func(ctx *Context, args []string) protocol.Value
@@ -67,13 +62,14 @@ func (r *Registry) Names() []string {
 	return out
 }
 
-// RegisterDefaults registers M1 connectivity / health commands (no data plane yet).
-func RegisterDefaults(r *Registry) {
+// RegisterDefaults registers connectivity / health commands (no data plane).
+// Pass tenants for INFO tenant stats; nil yields server section only.
+func RegisterDefaults(r *Registry, tenants *tenant.Registry) {
 	r.Register("PING", ping)
 	r.Register("ECHO", echo)
 	r.Register("QUIT", quit)
 	r.Register("COMMAND", makeCommandHandler(r))
-	r.Register("INFO", info)
+	r.Register("INFO", makeInfoHandler(tenants))
 }
 
 // ping: no arg → +PONG; one arg → bulk echo of that arg (Redis-compatible).
@@ -122,27 +118,66 @@ func makeCommandHandler(r *Registry) Handler {
 	}
 }
 
-func info(ctx *Context, args []string) protocol.Value {
-	if len(args) > 2 {
-		return protocol.ErrorValue("ERR wrong number of arguments for 'info' command")
-	}
-	section := "server"
-	if len(args) == 2 {
-		section = strings.ToLower(args[1])
-	}
+func makeInfoHandler(tenants *tenant.Registry) Handler {
+	return func(ctx *Context, args []string) protocol.Value {
+		if len(args) > 2 {
+			return protocol.ErrorValue("ERR wrong number of arguments for 'info' command")
+		}
+		section := "default"
+		if len(args) == 2 {
+			section = strings.ToLower(args[1])
+		}
 
-	var b strings.Builder
-	switch section {
-	case "server", "default", "all":
-		b.WriteString("# Server\r\n")
-		b.WriteString("redis_mode:standalone\r\n")
-		b.WriteString("tcp_port:9001\r\n")
-		b.WriteString(fmt.Sprintf("go_version:%s\r\n", runtime.Version()))
-		b.WriteString("executable:cache-custom\r\n")
-		b.WriteString("\r\n")
-	default:
-		// Empty body for unknown sections (Redis returns empty for some).
-		return protocol.BulkStringValue("")
+		var b strings.Builder
+		writeServer := func() {
+			b.WriteString("# Server\r\n")
+			b.WriteString("redis_mode:standalone\r\n")
+			b.WriteString("tcp_port:9001\r\n")
+			b.WriteString(fmt.Sprintf("go_version:%s\r\n", runtime.Version()))
+			b.WriteString("executable:cache-custom\r\n")
+			b.WriteString("\r\n")
+		}
+		writeTenants := func() {
+			if tenants == nil {
+				return
+			}
+			b.WriteString("# Tenants\r\n")
+			b.WriteString(fmt.Sprintf("tenant_count:%d\r\n", tenants.Len()))
+			for _, t := range tenants.All() {
+				used, max, keys, hits, misses, evictions := t.DB.Stats()
+				status := "active"
+				if t.Status != tenant.StatusActive {
+					status = "disabled"
+				}
+				prefix := "tenant_" + t.Name + "_"
+				b.WriteString(fmt.Sprintf("%sstatus:%s\r\n", prefix, status))
+				b.WriteString(fmt.Sprintf("%sused_memory:%d\r\n", prefix, used))
+				b.WriteString(fmt.Sprintf("%smax_memory:%d\r\n", prefix, max))
+				b.WriteString(fmt.Sprintf("%skeys:%d\r\n", prefix, keys))
+				b.WriteString(fmt.Sprintf("%shits:%d\r\n", prefix, hits))
+				b.WriteString(fmt.Sprintf("%smisses:%d\r\n", prefix, misses))
+				b.WriteString(fmt.Sprintf("%sevictions:%d\r\n", prefix, evictions))
+				b.WriteString(fmt.Sprintf("%sstrategy:%d\r\n", prefix, int(t.Strategy)))
+				b.WriteString(fmt.Sprintf("%sshards:%d\r\n", prefix, t.Shards))
+			}
+			// Bound tenant summary (if any).
+			if ctx != nil && ctx.Tenant != nil {
+				b.WriteString(fmt.Sprintf("current_tenant:%s\r\n", ctx.Tenant.Name))
+			}
+			b.WriteString("\r\n")
+		}
+
+		switch section {
+		case "server":
+			writeServer()
+		case "tenants":
+			writeTenants()
+		case "default", "all":
+			writeServer()
+			writeTenants()
+		default:
+			return protocol.BulkStringValue("")
+		}
+		return protocol.BulkStringValue(b.String())
 	}
-	return protocol.BulkStringValue(b.String())
 }
