@@ -120,6 +120,8 @@ func (s *Server) untrack(c net.Conn) {
 func (s *Server) handleConn(conn net.Conn) {
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
+	// Per-connection context so AUTH tenant binding persists across commands.
+	ctx := &command.Context{}
 
 	for {
 		if s.ReadTimeout > 0 {
@@ -137,7 +139,6 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		}
 
-		ctx := &command.Context{}
 		reply := s.Registry.Dispatch(ctx, args)
 		if err := protocol.Write(bw, reply); err != nil {
 			return

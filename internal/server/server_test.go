@@ -10,12 +10,14 @@ import (
 
 	"cache-custom/internal/command"
 	"cache-custom/internal/protocol"
+	"cache-custom/internal/store"
+	"cache-custom/internal/tenant"
 )
 
 func startTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	reg := command.NewRegistry()
-	command.RegisterDefaults(reg)
+	command.RegisterDefaults(reg, nil)
 	s := New("127.0.0.1:0", reg)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -171,5 +173,73 @@ func TestServerInfo(t *testing.T) {
 	v := readValue(t, c)
 	if v.Type != protocol.BulkString || !strings.Contains(v.Str, "# Server") {
 		t.Fatalf("got %+v", v)
+	}
+}
+
+func TestServerAuthIsolation(t *testing.T) {
+	tenants, err := tenant.NewRegistry([]tenant.Config{
+		{Name: "App1", Password: "p1", MaxMemory: 1 << 20, Strategy: store.StrategyGlobalTrack, ShardCount: 2},
+		{Name: "App2", Password: "p2", MaxMemory: 1 << 20, Strategy: store.StrategySteal, ShardCount: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tenants.Close)
+
+	reg := command.NewRegistry()
+	command.RegisterDefaults(reg, nil)
+	command.RegisterAuth(reg, tenants)
+	command.RegisterStringCommands(reg)
+
+	s := New("127.0.0.1:0", reg)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	go func() { _ = s.Serve(ln) }()
+	t.Cleanup(func() { _ = s.Close() })
+
+	// Wait for listen
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	c1 := dial(t, addr)
+	writeRaw(t, c1, "*3\r\n$4\r\nAUTH\r\n$4\r\nApp1\r\n$2\r\np1\r\n")
+	if v := readValue(t, c1); v.Str != "OK" {
+		t.Fatalf("auth1 %+v", v)
+	}
+	writeRaw(t, c1, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nva1\r\n")
+	if v := readValue(t, c1); v.Str != "OK" {
+		t.Fatalf("set1 %+v", v)
+	}
+
+	c2 := dial(t, addr)
+	writeRaw(t, c2, "*3\r\n$4\r\nAUTH\r\n$4\r\nApp2\r\n$2\r\np2\r\n")
+	_ = readValue(t, c2)
+	writeRaw(t, c2, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nva2\r\n")
+	_ = readValue(t, c2)
+
+	writeRaw(t, c1, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+	v1 := readValue(t, c1)
+	writeRaw(t, c2, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+	v2 := readValue(t, c2)
+	if v1.Str != "va1" || v2.Str != "va2" {
+		t.Fatalf("isolation v1=%+v v2=%+v", v1, v2)
+	}
+
+	// Unauthenticated GET
+	c3 := dial(t, addr)
+	writeRaw(t, c3, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+	v3 := readValue(t, c3)
+	if v3.Type != protocol.Error || v3.Str != "NOAUTH Authentication required." {
+		t.Fatalf("noauth %+v", v3)
 	}
 }
