@@ -1,18 +1,22 @@
 [
-	{
-		"Name": "App1",
-		"AppId": 1,
-		"MaxMemory": 20,
-		"Lru": true,
-		"Lfu": false,
-		"MaxTTL": 3600
-	},
-	{
-		"Name": "App2",
-		"AppId": 2,
-		"MaxMemory": 20,
-		"Lru": false,
-		"Lfu": true,
-		"MaxTTL": 3600
-	}
+  {
+    "Name": "App1",
+    "AppId": 1,
+    "MaxMemory": 1048576,
+    "Lru": true,
+    "Lfu": false,
+    "MaxTTL": 3600,
+    "ShardCount": 4,
+    "ShardingStrategy": 1
+  },
+  {
+    "Name": "App2",
+    "AppId": 2,
+    "MaxMemory": 1048576,
+    "Lru": false,
+    "Lfu": true,
+    "MaxTTL": 3600,
+    "ShardCount": 4,
+    "ShardingStrategy": 2
+  }
 ]

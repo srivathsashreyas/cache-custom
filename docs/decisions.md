@@ -139,3 +139,27 @@ Format: **ID**, date, status, context, decision, consequences.
 ## Supersession
 
 None yet. To change a decision, add a new ID that references the old one and set the old status to **Superseded**.
+
+---
+
+## D012 — Per-tenant sharding strategies (three modes)
+
+| | |
+|--|--|
+| **Date** | 2026-07-10 |
+| **Status** | Accepted |
+| **Context** | Intra-node sharding needs configurable eviction coupling between shards. |
+| **Decision** | Each tenant selects one of: **(1)** sharded data + **global** (tenant-wide) eviction tracking against `maxmemory`; **(2)** evict when global limit hit, prefer target shard, **steal** from other shards if the target is empty; **(3)** **per-shard budget** (`maxmemory/N`), local eviction only, reject if the shard cannot fit the entry. |
+| **Consequences** | Store API and `config.json` expose `ShardingStrategy` + `ShardCount`. Tests cover all three modes. |
+
+---
+
+## D013 — Lazy + periodic TTL expiry
+
+| | |
+|--|--|
+| **Date** | 2026-07-10 |
+| **Status** | Accepted |
+| **Context** | Lazy-only expiry delays reclaim until a key is touched. |
+| **Decision** | Always implement **both** lazy expiry on access **and** periodic active expiry (heap + background worker). |
+| **Consequences** | Expired keys are removed without requiring a read; access path still defensively expires. |

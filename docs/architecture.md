@@ -101,15 +101,15 @@ Each tenant configures at least:
 
 ### Per-key TTL
 
-- Keys may carry individual TTLs (`EXPIRE` / `SET EX`, etc.).
-- Active expiry (heap or equivalent) + lazy expiry on access.
+- Keys may carry individual TTLs (`EXPIRE` / `SET EX` / `PX`, etc.).
+- **Lazy expiry** on access (GET/SET/… treat expired keys as missing and delete them).
+- **Periodic (active) expiry** via a background worker + min-heap of deadlines (not lazy-only).
 - Tenant max TTL clamps requested TTLs.
 
-### Memory accounting (direction)
+### Memory accounting
 
-- Charge key bytes + value bytes + documented structural overhead toward `maxmemory`.
-- Exact overhead model is refined when the store is implemented; document the formula when code lands.
-- Global process guardrails (sum of tenants vs host) come with the memory/ops milestones.
+- Charge `len(key) + len(value) + EntryOverhead` (currently **24** bytes) toward tenant `maxmemory` (and per-shard budget under strategy 3).
+- Global process guardrails (sum of tenants vs host) come with later ops milestones.
 
 ### Eviction vs TTL
 
@@ -199,6 +199,18 @@ HA/replication is **out of v1**; persistence is single-node disk recovery.
 | **Pod-per-tenant** | Ops pattern via one-tenant config | Unchanged |
 
 Intra-node sharding must preserve tenant isolation: never share a data shard across tenants in a way that allows cross-tenant visibility or coupled eviction.
+
+### Per-tenant sharding strategies (config)
+
+Keys hash to a shard. **Global** always means *within one tenant* (not across tenants). Config field `ShardingStrategy`:
+
+| ID | Name | Behavior |
+|----|------|----------|
+| **1** | Global eviction track | Data is sharded; eviction order is tracked **tenant-wide**. When tenant `maxmemory` is exceeded, evict by global LRU until the write fits. |
+| **2** | Steal across shards | Eviction runs only when tenant `maxmemory` is hit. Prefer evicting from the **target shard**; if that shard has no victims left, **steal** (evict) from other shards until there is room for the entry. |
+| **3** | Per-shard budget | Each shard gets roughly `maxmemory / ShardCount`. Evict **only inside the target shard** when its budget is exceeded. If the entry cannot fit in that shard after local eviction, **reject** (OOM) even if other shards have free space. |
+
+`ShardCount` is configurable per tenant (default 4).
 
 ---
 

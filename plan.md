@@ -112,28 +112,32 @@ Use these as product contracts, not vague goals.
 
 **Deliverables**
 
-- In-memory store for string keys with binary-safe keys and values.
-- **Intra-node sharding** in the store (per architecture): key → shard; no single global hot mutex for all keys.
+- In-memory store for string keys with binary-safe keys and values (`internal/store`).
+- **Intra-node sharding** with **three per-tenant strategies** (D012):
+  1. Sharded data + **global (tenant-wide)** eviction tracking against `maxmemory`
+  2. Evict only when global limit hit; prefer target shard; **steal** from other shards if needed
+  3. **Per-shard budget** + local eviction only; reject if the entry cannot fit in-shard
 - Commands (T0 string/key set):
-  - `GET`, `SET` (including `EX`, `PX`, `NX`, `XX` as prioritized), `DEL`, `EXISTS`
+  - `GET`, `SET` (`EX`, `PX`, `NX`, `XX`, `KEEPTTL`), `DEL`, `EXISTS`
   - `MGET`, `MSET`
   - `INCR`, `DECR`, `INCRBY`, `DECRBY`
   - `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`
   - `TYPE`, `DBSIZE`
-- Per-key TTL with active expiry (reuse/adapt heap) plus lazy expiry on access.
+- Per-key TTL: **lazy expiry + periodic active expiry** (D013); tenant `MaxTTL` ceiling.
 - Remove public dependence on internal `uint64` key IDs.
-- Unit tests for expiry edge cases.
+- Unit tests for commands, expiry (lazy + periodic), and all three sharding strategies.
 
 **Design notes**
 
-- Align `Cache` interface with Redis semantics.
-- Tenant routing may still be “default tenant only” if M3 is next.
+- Memory charge: `len(key)+len(value)+EntryOverhead` (24).
+- Tenant routing may still be “default tenant only” if M3 is next (first `config.json` entry).
 
 **Acceptance criteria**
 
-- Standard client: set with TTL, get, expire, delete.
-- Missing keys / TTL behavior matches T0 contract.
-- Custom line protocol gone or debug-only (prefer gone).
+- Standard client: set with TTL, get, expire, delete, incr.
+- Missing keys / TTL behavior matches T0 contract; periodic expiry reclaims untouched keys.
+- Strategy 1–3 behave as specified under memory pressure.
+- Custom line protocol gone from the serve path.
 
 **Depends on:** M1.
 
