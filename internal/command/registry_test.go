@@ -110,6 +110,7 @@ func TestCommandList(t *testing.T) {
 func TestCommandCount(t *testing.T) {
 	r := newTestRegistry()
 	v := r.Dispatch(&Context{}, []string{"COMMAND", "COUNT"})
+	// Defaults only (PING/ECHO/QUIT/COMMAND/INFO); string cmds registered separately.
 	if v.Type != protocol.Integer || v.Int != 5 {
 		t.Fatalf("got %+v", v)
 	}

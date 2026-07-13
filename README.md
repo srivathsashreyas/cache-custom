@@ -1,125 +1,94 @@
 # Overview
 
-Multi-tenant cache server in Go. The long-term goal is a **Redis-protocol-compatible** cache with **per-tenant** memory limits and eviction policies (a differentiator vs Redis/Valkey namespaces).
+Multi-tenant cache server in Go. Goal: **Redis-protocol-compatible** cache with **per-tenant** memory limits, eviction, and **configurable intra-node sharding**.
 
-**Current wire protocol: RESP2** (same family as Redis). Connect with `redis-cli` or any Redis client.
+**Wire protocol: RESP2.** Use `redis-cli` or any Redis client.
 
-Architecture freeze and milestones: [docs/architecture.md](docs/architecture.md), [docs/decisions.md](docs/decisions.md), [plan.md](plan.md).
+Docs: [docs/architecture.md](docs/architecture.md) · [docs/decisions.md](docs/decisions.md) · [plan.md](plan.md)
 
-## Status (M1 — RESP foundation)
+## Status (M2 — strings + sharded store)
 
-| Working now | Not yet over RESP |
-|-------------|-------------------|
-| `PING`, `ECHO`, `QUIT` | `GET` / `SET` / `DEL` (cache still in-tree for later milestones) |
-| `COMMAND`, `INFO` (minimal) | Multi-tenant `AUTH` |
-| Pipelining, inline + RESP arrays | Pub/Sub, persistence |
+| Working | Later |
+|---------|--------|
+| `PING`, `ECHO`, `QUIT`, `COMMAND`, `INFO` | Multi-tenant `AUTH` (M3) |
+| `GET`/`SET`/`DEL`/`EXISTS`, `MGET`/`MSET` | Pub/Sub |
+| `INCR`/`DECR`/`INCRBY`/`DECRBY` | Persistence modes |
+| `EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`/`PERSIST` | GKE |
+| `TYPE`, `DBSIZE` | |
+| Lazy **and** periodic TTL expiry | |
+| 3 per-tenant sharding strategies | |
+
+M2 serves a **default keyspace** from the **first** tenant in `config.json`. Full AUTH multi-tenancy is M3.
 
 ## Build and run
 
 ```bash
-# from repo root
 go build -o go_cache ./cmd/cache-custom
-
-# config.json must be readable (cwd or pass -config)
-./go_cache
-# or:
 ./go_cache -addr :9001 -config config.json
 ```
 
-Requires Go **1.22+** (see `go.mod`).
+Go **1.22+**.
 
 ## Tenant config (`config.json`)
-
-Still used to load in-process tenant caches for upcoming milestones:
 
 ```json
 [
   {
     "Name": "App1",
     "AppId": 1,
-    "MaxMemory": 20,
+    "MaxMemory": 1048576,
     "Lru": true,
     "Lfu": false,
-    "MaxTTL": 3600
+    "MaxTTL": 3600,
+    "ShardCount": 4,
+    "ShardingStrategy": 1
   }
 ]
 ```
 
-Only one of `Lru` / `Lfu` may be true per tenant.
+| Field | Meaning |
+|-------|---------|
+| `MaxMemory` | Tenant memory budget (bytes) |
+| `MaxTTL` | Max per-key TTL in **seconds** (0 = no ceiling) |
+| `ShardCount` | Intra-node shards (default 4 if omitted/0) |
+| `ShardingStrategy` | `1` / `2` / `3` (see below) |
+| `Lru` / `Lfu` | Legacy flags (only one true); eviction order is LRU in the new store for M2 |
+
+### Sharding strategies (per tenant; “global” = within tenant)
+
+1. **Global eviction track** — sharded maps; eviction order is tenant-wide against `MaxMemory`.
+2. **Steal** — when tenant `MaxMemory` is hit, evict from the target shard first; if empty, steal victims from other shards.
+3. **Per-shard budget** — each shard ≈ `MaxMemory/N`; local eviction only; OOM if the entry cannot fit in that shard.
 
 ## Talk to the server
 
-### redis-cli
-
 ```bash
 redis-cli -p 9001 PING
-# PONG
-
-redis-cli -p 9001 PING hello
-# hello
-
-redis-cli -p 9001 ECHO "hi there"
-# hi there
-
-redis-cli -p 9001 COMMAND COUNT
-# (integer) 5
-
-redis-cli -p 9001 INFO server
-
-redis-cli -p 9001 QUIT
-```
-
-Interactive:
-
-```bash
-redis-cli -p 9001
-> PING
-PONG
-> ECHO world
-world
-```
-
-### Manual RESP / inline (optional)
-
-```bash
-# inline (telnet-style)
-printf 'PING\r\n' | nc localhost 9001
-
-# RESP array: *1\r\n$4\r\nPING\r\n
-printf '*1\r\n$4\r\nPING\r\n' | nc localhost 9001
+redis-cli -p 9001 SET mykey hello
+redis-cli -p 9001 GET mykey
+redis-cli -p 9001 SET t val PX 500
+redis-cli -p 9001 TTL t
+redis-cli -p 9001 INCR counter
+redis-cli -p 9001 MSET a 1 b 2
+redis-cli -p 9001 MGET a b missing
 ```
 
 ## Tests
 
 ```bash
-# unit + TCP integration + go-redis language client
 go test ./...
-
-# packages
-go test ./internal/protocol -v
-go test ./internal/command -v
-go test ./internal/server -v
-
-# language client only (github.com/redis/go-redis/v9)
+go test ./internal/store -v
+go test ./internal/command -run String -v
 go test ./internal/server -run GoRedis -v
 ```
 
-M1 acceptance covers both **raw RESP/TCP** tests and a real **Go Redis client** (`TestGoRedisClient*`).
-
-## Project layout
+## Layout
 
 ```text
-cmd/cache-custom/     # main, existing LRU/LFU/TTL store (not yet on RESP path)
-internal/protocol/    # RESP2 encode/decode
-internal/command/     # command registry + M1 handlers
-internal/server/      # TCP accept loop, per-connection RESP session
-docs/                 # architecture + decisions
-config.json
+cmd/cache-custom/     # main + config (+ legacy LRU sources behind //go:build legacy)
+internal/protocol/    # RESP2
+internal/command/     # registry + connectivity + string commands
+internal/server/      # TCP RESP server
+internal/store/       # sharded string store, TTL, eviction strategies
+docs/
 ```
-
-## Roadmap (short)
-
-1. **Done (M1):** RESP2 + connectivity commands  
-2. **Next:** string/`GET`/`SET`/TTL on RESP, then multi-tenant `AUTH`, Pub/Sub, persistence, GKE  
-
-See [plan.md](plan.md) for the full milestone list.
