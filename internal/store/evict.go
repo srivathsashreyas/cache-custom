@@ -6,11 +6,13 @@ import (
 )
 
 // pickLocalVictim chooses an eviction candidate in sh (sh.mu held). skipKey is never chosen.
+// Complexities: LRU/FIFO/LFU O(1); random O(1) expected; volatile-ttl O(log n) via min-heap.
 func (db *DB) pickLocalVictim(sh *shard, skipKey string, now time.Time) *entry {
 	pol := db.cfg.Policy
 	if pol == PolicyNoEviction {
 		return nil
 	}
+	vol := pol.volatileOnly()
 
 	switch pol {
 	case PolicyAllKeysLRU, PolicyAllKeysFIFO, PolicyVolatileLRU, PolicyVolatileFIFO:
@@ -25,16 +27,15 @@ func (db *DB) pickLocalVictim(sh *shard, skipKey string, now time.Time) *entry {
 		return nil
 
 	case PolicyAllKeysRandom, PolicyVolatileRandom:
-		return pickRandomFromMap(sh.data, skipKey, pol)
+		return sh.rndPick(skipKey, vol)
 
 	case PolicyAllKeysLFU, PolicyVolatileLFU:
-		return pickMinFreq(sh.data, skipKey, pol)
+		return sh.lfuPick(skipKey, vol)
 
 	case PolicyVolatileTTL:
-		return pickMinTTL(sh.data, skipKey, now)
+		return sh.ttlPick(skipKey, now)
 
 	default:
-		// Fallback: list head
 		for e := sh.head; e != nil; e = e.lNext {
 			if e.key != skipKey && pol.eligible(e) {
 				return e
@@ -44,8 +45,7 @@ func (db *DB) pickLocalVictim(sh *shard, skipKey string, now time.Time) *entry {
 	}
 }
 
-// pickGlobalVictimKey returns a key to evict tenant-wide (no shard locks held).
-// For list-based policies uses global list under gMu; for random/lfu/ttl samples shards.
+// pickGlobalVictimKey returns a tenant-wide victim key (no shard locks held by caller).
 func (db *DB) pickGlobalVictimKey(skipKey string, now time.Time) (key string, ok bool) {
 	pol := db.cfg.Policy
 	if pol == PolicyNoEviction {
@@ -68,115 +68,115 @@ func (db *DB) pickGlobalVictimKey(skipKey string, now time.Time) (key string, ok
 		db.gMu.Unlock()
 		return "", false
 
-	case PolicyAllKeysRandom, PolicyVolatileRandom,
-		PolicyAllKeysLFU, PolicyVolatileLFU, PolicyVolatileTTL:
-		return db.sampleGlobalVictim(skipKey, now)
+	case PolicyAllKeysRandom, PolicyVolatileRandom:
+		return db.pickGlobalRandom(skipKey)
+
+	case PolicyAllKeysLFU, PolicyVolatileLFU:
+		return db.pickGlobalLFU(skipKey)
+
+	case PolicyVolatileTTL:
+		return db.pickGlobalTTL(skipKey, now)
+
 	default:
-		return db.sampleGlobalVictim(skipKey, now)
+		return db.pickGlobalRandom(skipKey)
 	}
 }
 
-func (db *DB) sampleGlobalVictim(skipKey string, now time.Time) (string, bool) {
-	pol := db.cfg.Policy
+// pickGlobalRandom: O(1) expected — random shard then O(1) local random.
+func (db *DB) pickGlobalRandom(skipKey string) (string, bool) {
+	vol := db.cfg.Policy.volatileOnly()
 	n := len(db.shards)
 	start := rand.Intn(n)
-
-	var bestKey string
-	var haveBest bool
-	var bestFreq uint8
-	var bestRem time.Duration
-
 	for i := 0; i < n; i++ {
 		si := (start + i) % n
 		sh := db.shards[si]
 		sh.mu.Lock()
-		var cand *entry
-		switch pol {
-		case PolicyAllKeysRandom, PolicyVolatileRandom:
-			cand = pickRandomFromMap(sh.data, skipKey, pol)
-		case PolicyAllKeysLFU, PolicyVolatileLFU:
-			cand = pickMinFreq(sh.data, skipKey, pol)
-		case PolicyVolatileTTL:
-			cand = pickMinTTL(sh.data, skipKey, now)
-		default:
-			cand = pickMinFreq(sh.data, skipKey, pol)
-		}
-		if cand != nil {
-			// Snapshot fields before unlock (do not retain *entry across shards).
-			k, freq, rem := cand.key, cand.freq, remainingTTL(cand, now)
+		e := sh.rndPick(skipKey, vol)
+		if e != nil {
+			k := e.key
 			sh.mu.Unlock()
-			if pol == PolicyAllKeysRandom || pol == PolicyVolatileRandom {
-				return k, true
-			}
-			if !haveBest {
-				bestKey, bestFreq, bestRem, haveBest = k, freq, rem, true
-			} else if pol == PolicyAllKeysLFU || pol == PolicyVolatileLFU {
-				if freq < bestFreq || (freq == bestFreq && k < bestKey) {
-					bestKey, bestFreq = k, freq
-				}
-			} else if pol == PolicyVolatileTTL {
-				if rem < bestRem {
-					bestKey, bestRem = k, rem
-				}
-			}
-			continue
+			return k, true
 		}
 		sh.mu.Unlock()
 	}
-	return bestKey, haveBest
+	return "", false
 }
 
-func pickRandomFromMap(m map[string]*entry, skipKey string, pol EvictionPolicy) *entry {
-	if len(m) == 0 {
-		return nil
+// pickGlobalLFU: O(numShards) with O(1) work per shard (min-freq bucket head).
+func (db *DB) pickGlobalLFU(skipKey string) (string, bool) {
+	vol := db.cfg.Policy.volatileOnly()
+	var bestKey string
+	var bestFreq uint8
+	found := false
+	for _, sh := range db.shards {
+		sh.mu.Lock()
+		e := sh.lfuPick(skipKey, vol)
+		if e != nil {
+			if !found || e.freq < bestFreq || (e.freq == bestFreq && e.key < bestKey) {
+				bestKey, bestFreq, found = e.key, e.freq, true
+			}
+		}
+		sh.mu.Unlock()
 	}
-	// Reservoir-style among eligible.
-	var chosen *entry
-	n := 0
-	for _, e := range m {
-		if e.key == skipKey || !pol.eligible(e) {
+	return bestKey, found
+}
+
+// pickGlobalTTL: O(log n) via tenant expiry min-heap (soonest deadline).
+func (db *DB) pickGlobalTTL(skipKey string, now time.Time) (string, bool) {
+	for {
+		db.expMu.Lock()
+		if len(db.expH) == 0 {
+			db.expMu.Unlock()
+			return "", false
+		}
+		item := db.expH[0]
+		db.expMu.Unlock()
+
+		if item.key == skipKey {
+			// Cannot evict the key being written; drop heap entry only if it is still min and skip.
+			// Leave heap intact and scan: temporarily not O(log n) worst-case if skip is always min.
+			// Rare: peek next by removing skip from consideration via re-check under shard.
+			si := db.shardIndex(item.key)
+			sh := db.shards[si]
+			sh.mu.Lock()
+			// Find any other TTL key in same shard first (cheap), else try other shards' heaps.
+			e := sh.ttlPick(skipKey, now)
+			sh.mu.Unlock()
+			if e != nil {
+				return e.key, true
+			}
+			// Fall back: O(shards) local ttl picks.
+			for _, osh := range db.shards {
+				osh.mu.Lock()
+				cand := osh.ttlPick(skipKey, now)
+				if cand != nil {
+					k := cand.key
+					osh.mu.Unlock()
+					return k, true
+				}
+				osh.mu.Unlock()
+			}
+			return "", false
+		}
+
+		// Validate key still exists with a TTL.
+		si := db.shardIndex(item.key)
+		sh := db.shards[si]
+		sh.mu.Lock()
+		e, ok := sh.data[item.key]
+		if !ok || e.expiresAt.IsZero() {
+			sh.mu.Unlock()
+			db.clearExpiry(item.key)
 			continue
 		}
-		n++
-		if rand.Intn(n) == 0 {
-			chosen = e
-		}
-	}
-	return chosen
-}
-
-func pickMinFreq(m map[string]*entry, skipKey string, pol EvictionPolicy) *entry {
-	var best *entry
-	for _, e := range m {
-		if e.key == skipKey || !pol.eligible(e) {
+		// Stale heap time: still a valid volatile key; prefer true min under shard heap.
+		if !e.expiresAt.Equal(item.at) {
+			sh.mu.Unlock()
+			db.noteExpiry(item.key, e.expiresAt)
 			continue
 		}
-		if best == nil || e.freq < best.freq || (e.freq == best.freq && e.key < best.key) {
-			best = e
-		}
-	}
-	return best
-}
-
-func pickMinTTL(m map[string]*entry, skipKey string, now time.Time) *entry {
-	var best *entry
-	var bestRem time.Duration
-	for _, e := range m {
-		if e.key == skipKey || e.expiresAt.IsZero() {
-			continue
-		}
-		rem := remainingTTL(e, now)
-		if best == nil || rem < bestRem {
-			best = e
-			bestRem = rem
-		}
-	}
-	return best
-}
-
-// bumpLFU increments a saturating approximate counter (simple LFU).
-func bumpLFU(e *entry) {
-	if e.freq < 255 {
-		e.freq++
+		k := e.key
+		sh.mu.Unlock()
+		return k, true
 	}
 }

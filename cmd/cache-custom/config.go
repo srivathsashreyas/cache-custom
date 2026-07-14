@@ -18,10 +18,9 @@ type Config struct {
 	// MaxMemory is the tenant memory budget in bytes.
 	MaxMemory uint64
 	// EvictionPolicy: Redis-like name (+ allkeys-fifo / volatile-fifo). Empty => allkeys-lru.
-	// Legacy Lru/Lfu bools are used only when EvictionPolicy is empty.
+	// Supported: noeviction, allkeys-lru, allkeys-lfu, allkeys-random, allkeys-fifo,
+	// volatile-lru, volatile-lfu, volatile-random, volatile-ttl, volatile-fifo.
 	EvictionPolicy string
-	Lru            bool
-	Lfu            bool
 	// MaxTTL is the ceiling for per-key TTL in seconds (0 = no ceiling).
 	MaxTTL int64
 	// ShardCount is the number of intra-node shards (default 4).
@@ -48,9 +47,6 @@ func readConfig(path string) ([]Config, error) {
 		if configs[i].Password == "" {
 			return nil, errors.New("each tenant requires Password")
 		}
-		if configs[i].Lru && configs[i].Lfu {
-			return nil, errors.New("only one of Lru/Lfu may be true")
-		}
 		if configs[i].EvictionPolicy != "" {
 			if _, ok := store.ParseEvictionPolicy(configs[i].EvictionPolicy); !ok {
 				return nil, errors.New("invalid EvictionPolicy for tenant " + configs[i].Name)
@@ -68,15 +64,6 @@ func readConfig(path string) ([]Config, error) {
 }
 
 func evictionFromConfig(c Config) store.EvictionPolicy {
-	if c.EvictionPolicy != "" {
-		p, _ := store.ParseEvictionPolicy(c.EvictionPolicy)
-		return p
-	}
-	if c.Lfu {
-		return store.PolicyAllKeysLFU
-	}
-	if c.Lru {
-		return store.PolicyAllKeysLRU
-	}
-	return store.PolicyAllKeysLRU
+	p, _ := store.ParseEvictionPolicy(c.EvictionPolicy)
+	return p
 }

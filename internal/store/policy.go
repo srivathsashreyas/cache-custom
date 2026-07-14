@@ -46,22 +46,8 @@ func (p EvictionPolicy) volatileOnly() bool {
 	}
 }
 
-func (p EvictionPolicy) touchesOnAccess() bool {
-	switch p {
-	case PolicyAllKeysLRU, PolicyVolatileLRU:
-		return true
-	default:
-		return false
-	}
-}
-
-func (p EvictionPolicy) bumpsLFUOnAccess() bool {
-	switch p {
-	case PolicyAllKeysLFU, PolicyVolatileLFU:
-		return true
-	default:
-		return false
-	}
+func (p EvictionPolicy) usesLFU() bool {
+	return p == PolicyAllKeysLFU || p == PolicyVolatileLFU
 }
 
 func (p EvictionPolicy) eligible(e *entry) bool {
@@ -71,7 +57,6 @@ func (p EvictionPolicy) eligible(e *entry) bool {
 	return !e.expiresAt.IsZero()
 }
 
-// remainingTTL for volatile-ttl comparison; larger remaining is kept longer.
 func remainingTTL(e *entry, now time.Time) time.Duration {
 	if e.expiresAt.IsZero() {
 		return time.Duration(1<<63 - 1)

@@ -139,3 +139,100 @@ func (db *DB) swapExp(i, j int) {
 	db.expIdx[db.expH[i].key] = i
 	db.expIdx[db.expH[j].key] = j
 }
+
+// --- per-shard TTL min-heap (for local volatile-ttl eviction), sh.mu held ---
+
+func (sh *shard) ttlUpdate(key string, at time.Time) {
+	if idx, ok := sh.ttlIdx[key]; ok {
+		sh.ttlHeapRemoveAt(idx)
+	}
+	if at.IsZero() {
+		return
+	}
+	sh.ttlHeapPush(expItem{key: key, at: at})
+}
+
+func (sh *shard) ttlRemove(key string) {
+	if idx, ok := sh.ttlIdx[key]; ok {
+		sh.ttlHeapRemoveAt(idx)
+	}
+}
+
+// ttlPick returns the key with soonest expiry in this shard (O(log n) after stale pops).
+func (sh *shard) ttlPick(skipKey string, now time.Time) *entry {
+	for len(sh.ttlH) > 0 {
+		item := sh.ttlH[0]
+		e, ok := sh.data[item.key]
+		if !ok || e.expiresAt.IsZero() || !e.expiresAt.Equal(item.at) {
+			sh.ttlHeapRemoveAt(0)
+			continue
+		}
+		if item.key == skipKey {
+			// Look at next candidates without destroying order permanently:
+			// temporarily remove, pick next, re-push skip.
+			sh.ttlHeapRemoveAt(0)
+			cand := sh.ttlPick(skipKey, now)
+			sh.ttlHeapPush(item)
+			return cand
+		}
+		if e.expired(now) {
+			// Leave for lazy/periodic expiry; still a valid eviction candidate.
+			return e
+		}
+		return e
+	}
+	return nil
+}
+
+func (sh *shard) ttlHeapPush(it expItem) {
+	sh.ttlH = append(sh.ttlH, it)
+	sh.ttlIdx[it.key] = len(sh.ttlH) - 1
+	sh.ttlSiftUp(len(sh.ttlH) - 1)
+}
+
+func (sh *shard) ttlHeapRemoveAt(i int) {
+	n := len(sh.ttlH) - 1
+	key := sh.ttlH[i].key
+	sh.ttlSwap(i, n)
+	sh.ttlH = sh.ttlH[:n]
+	delete(sh.ttlIdx, key)
+	if i < n {
+		sh.ttlSiftDown(i)
+		sh.ttlSiftUp(i)
+	}
+}
+
+func (sh *shard) ttlSiftUp(i int) {
+	for i > 0 {
+		p := (i - 1) / 2
+		if !sh.ttlH[i].at.Before(sh.ttlH[p].at) {
+			break
+		}
+		sh.ttlSwap(i, p)
+		i = p
+	}
+}
+
+func (sh *shard) ttlSiftDown(i int) {
+	n := len(sh.ttlH)
+	for {
+		l, r, smallest := 2*i+1, 2*i+2, i
+		if l < n && sh.ttlH[l].at.Before(sh.ttlH[smallest].at) {
+			smallest = l
+		}
+		if r < n && sh.ttlH[r].at.Before(sh.ttlH[smallest].at) {
+			smallest = r
+		}
+		if smallest == i {
+			return
+		}
+		sh.ttlSwap(i, smallest)
+		i = smallest
+	}
+}
+
+func (sh *shard) ttlSwap(i, j int) {
+	sh.ttlH[i], sh.ttlH[j] = sh.ttlH[j], sh.ttlH[i]
+	sh.ttlIdx[sh.ttlH[i].key] = i
+	sh.ttlIdx[sh.ttlH[j].key] = j
+}

@@ -54,7 +54,6 @@ Go **1.22+**.
 | `ShardingStrategy` | `1` / `2` / `3` (see below) |
 | `EvictionPolicy` | e.g. `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `allkeys-fifo`, `noeviction`, `volatile-*` |
 | `Disabled` | If true, AUTH rejected for this tenant |
-| `Lru` / `Lfu` | Legacy flags; eviction is LRU until M4 |
 
 ### Sharding strategies (per tenant; “global” = within tenant)
 

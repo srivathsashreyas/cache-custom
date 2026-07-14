@@ -174,4 +174,4 @@ None yet. To change a decision, add a new ID that references the old one and set
 | **Status** | Accepted |
 | **Context** | M4 needs Redis-like maxmemory policies; product also wants FIFO. |
 | **Decision** | Support Redis names: `noeviction`, `allkeys-lru`/`lfu`/`random`, `volatile-lru`/`lfu`/`random`/`ttl`. **Additionally** `allkeys-fifo` and `volatile-fifo` (not in stock Redis). Random **is** a Redis policy; FIFO is not. |
-| **Consequences** | Config field `EvictionPolicy`; legacy `Lru`/`Lfu` bools map to allkeys-lru/lfu when policy string empty. |
+| **Consequences** | Config field `EvictionPolicy` only (no legacy Lru/Lfu flags). LFU uses O(1) freq buckets; volatile-ttl uses min-heaps. |

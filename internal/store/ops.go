@@ -27,9 +27,9 @@ func (db *DB) Get(key string) (string, bool) {
 		db.misses.Add(1)
 		return "", false
 	}
-	db.onAccess(sh, e)
+	movedLRU := db.touch(sh, e)
 	val := e.value
-	needGlobal := db.cfg.Strategy == StrategyGlobalTrack && db.cfg.Policy.touchesOnAccess()
+	needGlobal := movedLRU && db.cfg.Strategy == StrategyGlobalTrack
 	sh.mu.Unlock()
 
 	if needGlobal {
@@ -45,13 +45,19 @@ func (db *DB) Get(key string) (string, bool) {
 	return val, true
 }
 
-// onAccess updates recency/frequency under shard lock according to eviction policy.
-func (db *DB) onAccess(sh *shard, e *entry) {
-	if db.cfg.Policy.touchesOnAccess() {
+// touch updates eviction metadata for an accessed/updated entry (shard mu held).
+// Returns true if the local order list was reordered (LRU) so global list may need the same.
+func (db *DB) touch(sh *shard, e *entry) bool {
+	switch db.cfg.Policy {
+	case PolicyAllKeysLRU, PolicyVolatileLRU:
 		sh.lruTouch(e)
-	}
-	if db.cfg.Policy.bumpsLFUOnAccess() {
-		bumpLFU(e)
+		return true
+	case PolicyAllKeysLFU, PolicyVolatileLFU:
+		sh.lfuBump(e)
+		return false
+	default:
+		// FIFO / random / TTL / noeviction: access does not change eviction order.
+		return false
 	}
 }
 
@@ -177,14 +183,11 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 			existing.expiresAt = expiresAt
 		}
 		finalExp := existing.expiresAt
-		// Updates: LRU moves to MRU; FIFO keeps insertion position; LFU bumps freq.
-		if db.cfg.Policy.touchesOnAccess() {
-			sh.lruTouch(existing)
-		}
-		if db.cfg.Policy.bumpsLFUOnAccess() {
-			bumpLFU(existing)
-		}
-		if db.cfg.Strategy == StrategyGlobalTrack && db.cfg.Policy.touchesOnAccess() {
+		// Volatile-LFU: join/leave LFU set when TTL appears/disappears.
+		db.syncLFUMembership(sh, existing)
+		sh.ttlUpdate(key, finalExp)
+		moved := db.touch(sh, existing)
+		if moved && db.cfg.Strategy == StrategyGlobalTrack {
 			sh.mu.Unlock()
 			db.gMu.Lock()
 			if db.stillInGlobal(existing) {
@@ -199,11 +202,16 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 		return true, nil
 	}
 
-	e := &entry{key: key, value: value, expiresAt: expiresAt, size: newSize, freq: 5}
+	e := &entry{key: key, value: value, expiresAt: expiresAt, size: newSize, freq: 5, rndIdx: -1}
 	sh.data[key] = e
 	sh.used += newSize
 	db.addUsed(newSize)
 	sh.lruPushTail(e)
+	sh.rndAdd(e)
+	if db.cfg.Policy.usesLFU() && db.cfg.Policy.eligible(e) {
+		sh.lfuAdd(e)
+	}
+	sh.ttlUpdate(key, expiresAt)
 	if db.cfg.Strategy == StrategyGlobalTrack {
 		sh.mu.Unlock()
 		db.gMu.Lock()
@@ -215,6 +223,22 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 	sh.mu.Unlock()
 	db.noteExpiry(key, expiresAt)
 	return true, nil
+}
+
+// syncLFUMembership ensures e is in the LFU structure iff the policy wants it there.
+func (db *DB) syncLFUMembership(sh *shard, e *entry) {
+	if !db.cfg.Policy.usesLFU() {
+		if e.inLFU {
+			sh.lfuRemove(e)
+		}
+		return
+	}
+	want := db.cfg.Policy.eligible(e)
+	if want && !e.inLFU {
+		sh.lfuAdd(e)
+	} else if !want && e.inLFU {
+		sh.lfuRemove(e)
+	}
 }
 
 // ensureSpace requires sh.mu held on entry for target shard; may unlock/relock it.
@@ -348,11 +372,16 @@ func (db *DB) stealFromOtherShards(holdSI int, skipKey string) bool {
 	return false
 }
 
-// removeFromShard drops e from the shard map/local LRU and tenant used.
+// removeFromShard drops e from the shard map, order/random/LFU/TTL indexes, and tenant used.
 // sh.mu must be held. globalAlreadyUnlinked skips strategy-1 list unlink.
 func (db *DB) removeFromShard(sh *shard, e *entry, globalAlreadyUnlinked bool) {
 	delete(sh.data, e.key)
 	sh.lruRemove(e)
+	sh.rndRemove(e)
+	if e.inLFU {
+		sh.lfuRemove(e)
+	}
+	sh.ttlRemove(e.key)
 	if sh.used >= e.size {
 		sh.used -= e.size
 	} else {
@@ -361,12 +390,6 @@ func (db *DB) removeFromShard(sh *shard, e *entry, globalAlreadyUnlinked bool) {
 	db.subUsed(e.size)
 
 	if db.cfg.Strategy == StrategyGlobalTrack && !globalAlreadyUnlinked {
-		// Never hold gMu while calling out; we already hold shard — take gMu second.
-		// Eviction path uses gMu then shard without holding both from the other direction
-		// on a second shard. Here: shard held, then gMu — eviction holds gMu only briefly
-		// without shard, then shard, then gMu again. Deadlock: this waits gMu while
-		// evictOneGlobal holds gMu... it doesn't hold gMu across shard lock.
-		// evict: gMu lock/unlock; shard lock; gMu lock. This: shard; gMu. OK.
 		db.gMu.Lock()
 		if db.stillInGlobal(e) {
 			db.globalRemove(e)
@@ -455,6 +478,8 @@ func (db *DB) setExpireAt(key string, at time.Time) int64 {
 		return 0
 	}
 	e.expiresAt = at
+	db.syncLFUMembership(sh, e)
+	sh.ttlUpdate(key, at)
 	sh.mu.Unlock()
 	db.noteExpiry(key, at)
 	return 1
@@ -482,6 +507,8 @@ func (db *DB) Persist(key string) int64 {
 		return 0
 	}
 	e.expiresAt = time.Time{}
+	db.syncLFUMembership(sh, e)
+	sh.ttlUpdate(key, time.Time{})
 	sh.mu.Unlock()
 	db.clearExpiry(key)
 	return 1

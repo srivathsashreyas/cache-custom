@@ -74,21 +74,33 @@ type entry struct {
 	value     string
 	expiresAt time.Time // zero => no expiry
 	size      uint64
-	freq      uint8 // LFU counter (simple saturating)
+	freq      uint8 // LFU frequency
+	inLFU     bool
+	rndIdx    int // index in shard.rnd (-1 if absent)
 
-	// Separate DLL links for local and global (strategy 1) order lists.
-	// Head = oldest / LRU; tail = newest / MRU (or insertion order for FIFO).
+	// Order lists: local + global (strategy 1). Head = LRU/oldest FIFO.
 	lPrev, lNext *entry
 	gPrev, gNext *entry
+	// LFU same-frequency list.
+	fPrev, fNext *entry
 }
 
 type shard struct {
 	mu     sync.Mutex
 	data   map[string]*entry
 	used   uint64
-	budget uint64 // strategy 3
-	head   *entry // local order list head
-	tail   *entry
+	budget uint64
+	// Order list (LRU / FIFO).
+	head, tail *entry
+	// Random victim array (O(1) pick).
+	rnd []*entry
+	// LFU frequency buckets: freq -> list head.
+	lfu    map[uint8]*entry
+	lfuMin uint8
+	lfuSize int
+	// Per-shard TTL min-heap for local volatile-ttl eviction.
+	ttlH   []expItem
+	ttlIdx map[string]int
 }
 
 // New creates a DB and starts the periodic expiry worker.
@@ -126,6 +138,8 @@ func New(cfg Config) *DB {
 		db.shards[i] = &shard{
 			data:   make(map[string]*entry),
 			budget: b,
+			lfu:    make(map[uint8]*entry),
+			ttlIdx: make(map[string]int),
 		}
 	}
 
