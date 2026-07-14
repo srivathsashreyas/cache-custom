@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+
+	"cache-custom/internal/store"
 )
 
 // Config is one tenant entry in config.json.
@@ -15,8 +17,11 @@ type Config struct {
 	AppId    uint64
 	// MaxMemory is the tenant memory budget in bytes.
 	MaxMemory uint64
-	Lru       bool
-	Lfu       bool
+	// EvictionPolicy: Redis-like name (+ allkeys-fifo / volatile-fifo). Empty => allkeys-lru.
+	// Legacy Lru/Lfu bools are used only when EvictionPolicy is empty.
+	EvictionPolicy string
+	Lru            bool
+	Lfu            bool
 	// MaxTTL is the ceiling for per-key TTL in seconds (0 = no ceiling).
 	MaxTTL int64
 	// ShardCount is the number of intra-node shards (default 4).
@@ -44,7 +49,12 @@ func readConfig(path string) ([]Config, error) {
 			return nil, errors.New("each tenant requires Password")
 		}
 		if configs[i].Lru && configs[i].Lfu {
-			return nil, errors.New("only one caching policy can be set for a tenant")
+			return nil, errors.New("only one of Lru/Lfu may be true")
+		}
+		if configs[i].EvictionPolicy != "" {
+			if _, ok := store.ParseEvictionPolicy(configs[i].EvictionPolicy); !ok {
+				return nil, errors.New("invalid EvictionPolicy for tenant " + configs[i].Name)
+			}
 		}
 		if configs[i].ShardCount < 0 {
 			return nil, errors.New("ShardCount must be >= 0")
@@ -55,4 +65,18 @@ func readConfig(path string) ([]Config, error) {
 		}
 	}
 	return configs, nil
+}
+
+func evictionFromConfig(c Config) store.EvictionPolicy {
+	if c.EvictionPolicy != "" {
+		p, _ := store.ParseEvictionPolicy(c.EvictionPolicy)
+		return p
+	}
+	if c.Lfu {
+		return store.PolicyAllKeysLFU
+	}
+	if c.Lru {
+		return store.PolicyAllKeysLRU
+	}
+	return store.PolicyAllKeysLRU
 }

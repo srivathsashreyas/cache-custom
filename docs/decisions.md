@@ -163,3 +163,15 @@ None yet. To change a decision, add a new ID that references the old one and set
 | **Context** | Lazy-only expiry delays reclaim until a key is touched. |
 | **Decision** | Always implement **both** lazy expiry on access **and** periodic active expiry (heap + background worker). |
 | **Consequences** | Expired keys are removed without requiring a read; access path still defensively expires. |
+
+---
+
+## D014 — Eviction policies including FIFO extension
+
+| | |
+|--|--|
+| **Date** | 2026-07-10 |
+| **Status** | Accepted |
+| **Context** | M4 needs Redis-like maxmemory policies; product also wants FIFO. |
+| **Decision** | Support Redis names: `noeviction`, `allkeys-lru`/`lfu`/`random`, `volatile-lru`/`lfu`/`random`/`ttl`. **Additionally** `allkeys-fifo` and `volatile-fifo` (not in stock Redis). Random **is** a Redis policy; FIFO is not. |
+| **Consequences** | Config field `EvictionPolicy`; legacy `Lru`/`Lfu` bools map to allkeys-lru/lfu when policy string empty. |

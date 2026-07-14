@@ -28,6 +28,7 @@ type Config struct {
 	MaxTTL    time.Duration // 0 = no ceiling
 	ShardCount int
 	Strategy   store.Strategy
+	Policy     store.EvictionPolicy
 	// Disabled tenants reject AUTH and data commands if already bound.
 	Disabled bool
 }
@@ -43,6 +44,7 @@ type Tenant struct {
 	// Cached config for INFO/stats (limits do not change at runtime in M3).
 	MaxMemory uint64
 	Strategy  store.Strategy
+	Policy    store.EvictionPolicy
 	Shards    int
 }
 
@@ -79,10 +81,15 @@ func NewRegistry(cfgs []Config) (*Registry, error) {
 		if st < store.StrategyGlobalTrack || st > store.StrategyShardBudget {
 			st = store.StrategyGlobalTrack
 		}
+		pol := c.Policy
+		if pol == "" {
+			pol = store.PolicyAllKeysLRU
+		}
 		db := store.New(store.Config{
 			MaxMemory:      c.MaxMemory,
 			ShardCount:     sc,
 			Strategy:       st,
+			Policy:         pol,
 			MaxTTL:         c.MaxTTL,
 			ExpiryInterval: time.Second,
 		})
@@ -98,6 +105,7 @@ func NewRegistry(cfgs []Config) (*Registry, error) {
 			DB:        db,
 			MaxMemory: c.MaxMemory,
 			Strategy:  st,
+			Policy:    pol,
 			Shards:    sc,
 		}
 		r.byName[c.Name] = t

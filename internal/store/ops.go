@@ -27,9 +27,9 @@ func (db *DB) Get(key string) (string, bool) {
 		db.misses.Add(1)
 		return "", false
 	}
-	sh.lruTouch(e)
+	db.onAccess(sh, e)
 	val := e.value
-	needGlobal := db.cfg.Strategy == StrategyGlobalTrack
+	needGlobal := db.cfg.Strategy == StrategyGlobalTrack && db.cfg.Policy.touchesOnAccess()
 	sh.mu.Unlock()
 
 	if needGlobal {
@@ -43,6 +43,16 @@ func (db *DB) Get(key string) (string, bool) {
 
 	db.hits.Add(1)
 	return val, true
+}
+
+// onAccess updates recency/frequency under shard lock according to eviction policy.
+func (db *DB) onAccess(sh *shard, e *entry) {
+	if db.cfg.Policy.touchesOnAccess() {
+		sh.lruTouch(e)
+	}
+	if db.cfg.Policy.bumpsLFUOnAccess() {
+		bumpLFU(e)
+	}
 }
 
 // stillInGlobal reports whether e is currently linked in the tenant-global LRU (gMu held).
@@ -167,9 +177,14 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 			existing.expiresAt = expiresAt
 		}
 		finalExp := existing.expiresAt
-		sh.lruTouch(existing)
-		if db.cfg.Strategy == StrategyGlobalTrack {
-			// Touch global without holding shard: release, gMu, re-check.
+		// Updates: LRU moves to MRU; FIFO keeps insertion position; LFU bumps freq.
+		if db.cfg.Policy.touchesOnAccess() {
+			sh.lruTouch(existing)
+		}
+		if db.cfg.Policy.bumpsLFUOnAccess() {
+			bumpLFU(existing)
+		}
+		if db.cfg.Strategy == StrategyGlobalTrack && db.cfg.Policy.touchesOnAccess() {
 			sh.mu.Unlock()
 			db.gMu.Lock()
 			if db.stillInGlobal(existing) {
@@ -184,7 +199,7 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 		return true, nil
 	}
 
-	e := &entry{key: key, value: value, expiresAt: expiresAt, size: newSize}
+	e := &entry{key: key, value: value, expiresAt: expiresAt, size: newSize, freq: 5}
 	sh.data[key] = e
 	sh.used += newSize
 	db.addUsed(newSize)
@@ -204,15 +219,36 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 
 // ensureSpace requires sh.mu held on entry for target shard; may unlock/relock it.
 func (db *DB) ensureSpace(sh *shard, si int, key string, need, newSize uint64, exists bool) error {
-	switch db.cfg.Strategy {
-	case StrategyGlobalTrack:
-		if newSize > db.cfg.MaxMemory {
+	// Hard ceiling: single entry larger than the limit cannot be stored.
+	limit := db.cfg.MaxMemory
+	if db.cfg.Strategy == StrategyShardBudget {
+		if newSize > sh.budget {
 			return ErrOOM
 		}
-		// Drop target shard while doing global eviction so other keys stay concurrent.
+	} else if newSize > limit {
+		return ErrOOM
+	}
+
+	// noeviction: never free space; OOM when full.
+	if db.cfg.Policy == PolicyNoEviction {
+		switch db.cfg.Strategy {
+		case StrategyShardBudget:
+			if sh.used+need > sh.budget {
+				return ErrOOM
+			}
+		default:
+			if db.used.Load()+need > limit {
+				return ErrOOM
+			}
+		}
+		return nil
+	}
+
+	switch db.cfg.Strategy {
+	case StrategyGlobalTrack:
 		sh.mu.Unlock()
-		for db.used.Load()+need > db.cfg.MaxMemory {
-			if !db.evictOneGlobal() {
+		for db.used.Load()+need > limit {
+			if !db.evictOneGlobal(key) {
 				sh.mu.Lock()
 				return ErrOOM
 			}
@@ -221,83 +257,58 @@ func (db *DB) ensureSpace(sh *shard, si int, key string, need, newSize uint64, e
 		return nil
 
 	case StrategySteal:
-		if newSize > db.cfg.MaxMemory {
-			return ErrOOM
-		}
-		for db.used.Load()+need > db.cfg.MaxMemory {
-			if sh.head != nil {
-				if exists && sh.head.key == key {
-					if sh.head.lNext == nil {
-						return ErrOOM
-					}
-					sh.lruTouch(sh.head)
-				}
-				if sh.head != nil && (!exists || sh.head.key != key) {
-					db.evictLocalHead(sh)
-					continue
-				}
+		for db.used.Load()+need > limit {
+			if db.evictOneLocal(sh, key) {
+				continue
 			}
 			// Steal: release target, take another shard, come back.
 			sh.mu.Unlock()
-			if !db.stealFromOtherShards(si) {
+			if !db.stealFromOtherShards(si, key) {
 				sh.mu.Lock()
 				return ErrOOM
 			}
 			sh.mu.Lock()
-			// exists flag may be stale after unlock; refresh.
 			_, exists = sh.data[key]
+			_ = exists
 		}
 		return nil
 
 	case StrategyShardBudget:
-		if newSize > sh.budget {
-			return ErrOOM
-		}
 		for sh.used+need > sh.budget {
-			if sh.head == nil {
+			if !db.evictOneLocal(sh, key) {
 				return ErrOOM
 			}
-			if exists && sh.head.key == key {
-				if sh.head.lNext == nil {
-					return ErrOOM
-				}
-				sh.lruTouch(sh.head)
-			}
-			if sh.head == nil || (exists && sh.head.key == key) {
-				return ErrOOM
-			}
-			db.evictLocalHead(sh)
 		}
 		return nil
 	}
 	return nil
 }
 
-// evictOneGlobal removes one tenant-global LRU victim. No shard locks held by caller.
-func (db *DB) evictOneGlobal() bool {
-	db.gMu.Lock()
-	v := db.gHead
-	if v == nil {
-		db.gMu.Unlock()
+// evictOneGlobal removes one tenant-wide victim. No shard locks held by caller.
+// skipKey is never evicted (key being written).
+func (db *DB) evictOneGlobal(skipKey string) bool {
+	now := time.Now()
+	key, ok := db.pickGlobalVictimKey(skipKey, now)
+	if !ok {
 		return false
 	}
-	// Copy key then release gMu before shard lock (avoid lock-order inversion).
-	key := v.key
-	db.gMu.Unlock()
-
 	si := db.shardIndex(key)
 	sh := db.shards[si]
 	sh.mu.Lock()
 	cur, ok := sh.data[key]
 	if !ok {
 		sh.mu.Unlock()
-		// Stale list node — unlink under gMu.
+		// Stale global list node for list-based policies.
 		db.gMu.Lock()
-		if db.stillInGlobal(v) {
-			db.globalRemove(v)
+		// Best-effort: if head is stale and points at missing key, unlink if still linked.
+		for e := db.gHead; e != nil; e = e.gNext {
+			if e.key == key {
+				db.globalRemove(e)
+				break
+			}
 		}
 		db.gMu.Unlock()
-		return db.gHead != nil || db.used.Load() > 0
+		return true
 	}
 	db.removeFromShard(sh, cur, false)
 	sh.mu.Unlock()
@@ -306,20 +317,20 @@ func (db *DB) evictOneGlobal() bool {
 	return true
 }
 
-func (db *DB) evictLocalHead(sh *shard) {
-	v := sh.head
+// evictOneLocal picks and removes one victim in sh (sh.mu held).
+func (db *DB) evictOneLocal(sh *shard, skipKey string) bool {
+	v := db.pickLocalVictim(sh, skipKey, time.Now())
 	if v == nil {
-		return
+		return false
 	}
 	key := v.key
 	db.removeFromShard(sh, v, false)
 	db.evictions.Add(1)
-	// Expiry heap clear without holding shard.
-	// Caller often still holds sh.mu; clearExpiry only needs expMu — OK.
 	db.clearExpiry(key)
+	return true
 }
 
-func (db *DB) stealFromOtherShards(holdSI int) bool {
+func (db *DB) stealFromOtherShards(holdSI int, skipKey string) bool {
 	n := len(db.shards)
 	for i := 0; i < n; i++ {
 		si := (holdSI + 1 + i) % n
@@ -328,13 +339,11 @@ func (db *DB) stealFromOtherShards(holdSI int) bool {
 		}
 		osh := db.shards[si]
 		osh.mu.Lock()
-		if osh.head == nil {
-			osh.mu.Unlock()
-			continue
-		}
-		db.evictLocalHead(osh)
+		ok := db.evictOneLocal(osh, skipKey)
 		osh.mu.Unlock()
-		return true
+		if ok {
+			return true
+		}
 	}
 	return false
 }

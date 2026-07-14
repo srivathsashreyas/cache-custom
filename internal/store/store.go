@@ -29,13 +29,14 @@ const (
 // ErrOOM is returned when a write cannot fit under the configured strategy.
 var ErrOOM = errors.New("OOM command not allowed when used memory > 'maxmemory'")
 
-// Config configures a DB instance (one logical tenant keyspace for M2).
+// Config configures a DB instance (one logical tenant keyspace).
 type Config struct {
 	MaxMemory      uint64
 	ShardCount     int
 	Strategy       Strategy
-	MaxTTL         time.Duration // 0 = no ceiling on per-key TTL
-	ExpiryInterval time.Duration // periodic sweep; default 1s
+	Policy         EvictionPolicy // maxmemory eviction policy
+	MaxTTL         time.Duration  // 0 = no ceiling on per-key TTL
+	ExpiryInterval time.Duration  // periodic sweep; default 1s
 }
 
 // DB is a concurrent string store.
@@ -51,7 +52,7 @@ type DB struct {
 
 	used atomic.Uint64
 
-	// Strategy 1: tenant-global LRU order (not held across shard map ops longer than needed).
+	// Strategy 1: tenant-global recency/insertion list (not held across shard map ops).
 	gMu   sync.Mutex
 	gHead *entry
 	gTail *entry
@@ -73,8 +74,10 @@ type entry struct {
 	value     string
 	expiresAt time.Time // zero => no expiry
 	size      uint64
+	freq      uint8 // LFU counter (simple saturating)
 
-	// Separate DLL links for local (per-shard) and global (strategy 1) LRU lists.
+	// Separate DLL links for local and global (strategy 1) order lists.
+	// Head = oldest / LRU; tail = newest / MRU (or insertion order for FIFO).
 	lPrev, lNext *entry
 	gPrev, gNext *entry
 }
@@ -84,7 +87,7 @@ type shard struct {
 	data   map[string]*entry
 	used   uint64
 	budget uint64 // strategy 3
-	head   *entry // local LRU head = least recently used
+	head   *entry // local order list head
 	tail   *entry
 }
 
@@ -95,6 +98,12 @@ func New(cfg Config) *DB {
 	}
 	if cfg.Strategy < StrategyGlobalTrack || cfg.Strategy > StrategyShardBudget {
 		cfg.Strategy = StrategyGlobalTrack
+	}
+	if cfg.Policy == "" {
+		cfg.Policy = PolicyAllKeysLRU
+	}
+	if _, ok := ParseEvictionPolicy(string(cfg.Policy)); !ok {
+		cfg.Policy = PolicyAllKeysLRU
 	}
 	if cfg.ExpiryInterval <= 0 {
 		cfg.ExpiryInterval = time.Second

@@ -158,6 +158,7 @@ func makeInfoHandler(tenants *tenant.Registry) Handler {
 				b.WriteString(fmt.Sprintf("%smisses:%d\r\n", prefix, misses))
 				b.WriteString(fmt.Sprintf("%sevictions:%d\r\n", prefix, evictions))
 				b.WriteString(fmt.Sprintf("%sstrategy:%d\r\n", prefix, int(t.Strategy)))
+				b.WriteString(fmt.Sprintf("%seviction_policy:%s\r\n", prefix, t.Policy))
 				b.WriteString(fmt.Sprintf("%sshards:%d\r\n", prefix, t.Shards))
 			}
 			// Bound tenant summary (if any).
