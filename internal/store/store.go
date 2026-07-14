@@ -74,14 +74,15 @@ type entry struct {
 	value     string
 	expiresAt time.Time // zero => no expiry
 	size      uint64
-	freq      uint8 // LFU frequency
+	freq      int // LFU frequency (unbounded)
 	inLFU     bool
 	rndIdx    int // index in shard.rnd (-1 if absent)
+	bucket    *freqBucket
 
 	// Order lists: local + global (strategy 1). Head = LRU/oldest FIFO.
 	lPrev, lNext *entry
 	gPrev, gNext *entry
-	// LFU same-frequency list.
+	// LFU same-frequency list within a freqBucket.
 	fPrev, fNext *entry
 }
 
@@ -94,9 +95,9 @@ type shard struct {
 	head, tail *entry
 	// Random victim array (O(1) pick).
 	rnd []*entry
-	// LFU frequency buckets: freq -> list head.
-	lfu    map[uint8]*entry
-	lfuMin uint8
+	// LFU: map freq -> bucket; buckets form a DLL ordered by increasing freq.
+	freqMap map[int]*freqBucket
+	lfuMin  *freqBucket // lowest-frequency non-empty bucket
 	lfuSize int
 	// Per-shard TTL min-heap for local volatile-ttl eviction.
 	ttlH   []expItem
@@ -136,10 +137,10 @@ func New(cfg Config) *DB {
 			b++
 		}
 		db.shards[i] = &shard{
-			data:   make(map[string]*entry),
-			budget: b,
-			lfu:    make(map[uint8]*entry),
-			ttlIdx: make(map[string]int),
+			data:    make(map[string]*entry),
+			budget:  b,
+			freqMap: make(map[int]*freqBucket),
+			ttlIdx:  make(map[string]int),
 		}
 	}
 

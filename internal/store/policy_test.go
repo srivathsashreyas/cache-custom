@@ -96,6 +96,61 @@ func TestAllKeysLFUEvictsLowFreq(t *testing.T) {
 	})
 }
 
+// Frequencies are unbounded: past the old uint8 cap, cold keys must still lose to hot keys.
+func TestLFUUnboundedFreqStillCorrect(t *testing.T) {
+	db := newPolicyDB(PolicyAllKeysLFU, StrategyGlobalTrack, 80, 1)
+	defer db.Close()
+	_, _ = db.Set("hot", "xxxxxxxxxx", SetOptions{})
+	_, _ = db.Set("cold", "xxxxxxxxxx", SetOptions{})
+	// 300 gets ⇒ freq well above 255 if counter were saturated/wrong.
+	for i := 0; i < 300; i++ {
+		_, _ = db.Get("hot")
+	}
+	// One more access on cold keeps it at low freq (initial + 1).
+	_, _ = db.Get("cold")
+	if _, err := db.Set("other", "xxxxxxxxxx", SetOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.Get("cold"); ok {
+		t.Fatal("cold should be evicted under true LFU even after hot freq >> 255")
+	}
+	if _, ok := db.Get("hot"); !ok {
+		t.Fatal("hot must survive")
+	}
+}
+
+// Accesses while a key is non-volatile (not in the LFU index) must still count.
+// After TTL is applied, it should re-join at its true frequency, not the pre-leave freq only.
+func TestVolatileLFUTracksFreqWhileNotIndexed(t *testing.T) {
+	db := newPolicyDB(PolicyVolatileLFU, StrategyGlobalTrack, 80, 1)
+	defer db.Close()
+
+	// hot: no TTL → not an eviction candidate, but GETs must bump e.freq.
+	_, _ = db.Set("hot", "xxxxxxxxxx", SetOptions{})
+	for i := 0; i < 50; i++ {
+		_, _ = db.Get("hot")
+	}
+	// cold: has TTL, accessed once → low freq, is a candidate.
+	_, _ = db.Set("cold", "xxxxxxxxxx", SetOptions{EX: 3600})
+	_, _ = db.Get("cold")
+
+	// Give hot a TTL → joins LFU at high true frequency (not stuck at 1).
+	if db.Expire("hot", time.Hour) != 1 {
+		t.Fatal("expire hot")
+	}
+
+	// Pressure: should evict cold (low freq), not hot (many prior accesses).
+	if _, err := db.Set("other", "xxxxxxxxxx", SetOptions{EX: 3600}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.Get("cold"); ok {
+		t.Fatal("cold should be evicted; hot had higher access freq while non-volatile")
+	}
+	if _, ok := db.Get("hot"); !ok {
+		t.Fatal("hot should survive after re-joining at true frequency")
+	}
+}
+
 func TestAllKeysRandomEvictsUnderPressure(t *testing.T) {
 	runAcrossStrategies(t, "random", func(t *testing.T, strat Strategy) {
 		// Entry ~34 bytes; keep shard budget >= entry (max/shards).

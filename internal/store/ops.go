@@ -53,7 +53,8 @@ func (db *DB) touch(sh *shard, e *entry) bool {
 		sh.lruTouch(e)
 		return true
 	case PolicyAllKeysLFU, PolicyVolatileLFU:
-		sh.lfuBump(e)
+		// Frequency tracks accesses always; structure membership is separate (see syncLFUMembership).
+		sh.lfuOnAccess(e)
 		return false
 	default:
 		// FIFO / random / TTL / noeviction: access does not change eviction order.
@@ -202,7 +203,7 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 		return true, nil
 	}
 
-	e := &entry{key: key, value: value, expiresAt: expiresAt, size: newSize, freq: 5, rndIdx: -1}
+	e := &entry{key: key, value: value, expiresAt: expiresAt, size: newSize, freq: 1, rndIdx: -1}
 	sh.data[key] = e
 	sh.used += newSize
 	db.addUsed(newSize)
@@ -225,7 +226,10 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 	return true, nil
 }
 
-// syncLFUMembership ensures e is in the LFU structure iff the policy wants it there.
+// syncLFUMembership joins/leaves the LFU *eviction index* based on policy eligibility
+// (e.g. volatile-lfu only indexes keys that currently have a TTL).
+// It does not reset or recompute e.freq: frequency is access history and is updated
+// by lfuOnAccess even while the entry is not indexed.
 func (db *DB) syncLFUMembership(sh *shard, e *entry) {
 	if !db.cfg.Policy.usesLFU() {
 		if e.inLFU {
@@ -235,8 +239,10 @@ func (db *DB) syncLFUMembership(sh *shard, e *entry) {
 	}
 	want := db.cfg.Policy.eligible(e)
 	if want && !e.inLFU {
+		// Re-enter at true frequency (may be >> 1 after accesses while non-volatile).
 		sh.lfuAdd(e)
 	} else if !want && e.inLFU {
+		// Leave index only; keep e.freq for a future re-join.
 		sh.lfuRemove(e)
 	}
 }

@@ -106,7 +106,7 @@ func (db *DB) pickGlobalRandom(skipKey string) (string, bool) {
 func (db *DB) pickGlobalLFU(skipKey string) (string, bool) {
 	vol := db.cfg.Policy.volatileOnly()
 	var bestKey string
-	var bestFreq uint8
+	var bestFreq int
 	found := false
 	for _, sh := range db.shards {
 		sh.mu.Lock()
