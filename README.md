@@ -13,7 +13,8 @@ Docs: [docs/architecture.md](docs/architecture.md) · [docs/decisions.md](docs/d
 | `AUTH <Name> <Password>` → tenant bind | Full ACL |
 | Per-tenant isolated keyspaces + limits | Pub/Sub |
 | String/TTL commands (require AUTH) | Persistence modes |
-| Lazy + periodic expiry; 3 shard strategies | GKE / LFU matrix (M4) |
+| Lazy + periodic expiry; 3 shard strategies | GKE |
+| Per-tenant eviction policies (LRU/LFU/random/FIFO/…) | |
 | `INFO tenants` per-tenant stats | |
 
 Data commands require **`AUTH`**. Connectivity (`PING`/`ECHO`/`QUIT`/`COMMAND`/`INFO`) works without AUTH.
@@ -51,8 +52,8 @@ Go **1.22+**.
 | `MaxTTL` | Max per-key TTL in **seconds** (0 = no ceiling) |
 | `ShardCount` | Intra-node shards (default 4 if omitted/0) |
 | `ShardingStrategy` | `1` / `2` / `3` (see below) |
+| `EvictionPolicy` | e.g. `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `allkeys-fifo`, `noeviction`, `volatile-*` |
 | `Disabled` | If true, AUTH rejected for this tenant |
-| `Lru` / `Lfu` | Legacy flags; eviction is LRU until M4 |
 
 ### Sharding strategies (per tenant; “global” = within tenant)
 

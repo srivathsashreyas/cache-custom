@@ -29,13 +29,14 @@ const (
 // ErrOOM is returned when a write cannot fit under the configured strategy.
 var ErrOOM = errors.New("OOM command not allowed when used memory > 'maxmemory'")
 
-// Config configures a DB instance (one logical tenant keyspace for M2).
+// Config configures a DB instance (one logical tenant keyspace).
 type Config struct {
 	MaxMemory      uint64
 	ShardCount     int
 	Strategy       Strategy
-	MaxTTL         time.Duration // 0 = no ceiling on per-key TTL
-	ExpiryInterval time.Duration // periodic sweep; default 1s
+	Policy         EvictionPolicy // maxmemory eviction policy
+	MaxTTL         time.Duration  // 0 = no ceiling on per-key TTL
+	ExpiryInterval time.Duration  // periodic sweep; default 1s
 }
 
 // DB is a concurrent string store.
@@ -43,18 +44,22 @@ type Config struct {
 // Concurrency model (no single meta lock on the hot path):
 //   - each shard has its own mu (map + local LRU + shard used)
 //   - tenant-wide used memory is atomic
-//   - strategy 1 only: gMu protects the global LRU list (brief critical sections)
+//   - strategy 1 only: gMu protects global LRU/FIFO lists (brief critical sections)
 //   - expMu protects the expiry heap only
+// All eviction indexes (LRU, FIFO, LFU, random, TTL heaps) are maintained continuously
+// so SetEvictionPolicy is a flag flip without rebuild.
 type DB struct {
 	cfg    Config
 	shards []*shard
 
 	used atomic.Uint64
 
-	// Strategy 1: tenant-global LRU order (not held across shard map ops longer than needed).
-	gMu   sync.Mutex
-	gHead *entry
-	gTail *entry
+	// Strategy 1: always-on global recency + FIFO lists (not held across shard map ops).
+	gMu        sync.Mutex
+	gHead      *entry
+	gTail      *entry
+	gFifoHead  *entry
+	gFifoTail  *entry
 
 	expMu  sync.Mutex
 	expH   []expItem
@@ -73,19 +78,37 @@ type entry struct {
 	value     string
 	expiresAt time.Time // zero => no expiry
 	size      uint64
+	freq      int // LFU frequency (unbounded); always updated on access
+	inLFU     bool
+	rndIdx    int // index in shard.rnd (-1 if absent)
+	bucket    *freqBucket
 
-	// Separate DLL links for local (per-shard) and global (strategy 1) LRU lists.
-	lPrev, lNext *entry
-	gPrev, gNext *entry
+	// Always-on order indexes (policy only chooses which to read at eviction).
+	lPrev, lNext   *entry // local LRU recency
+	iPrev, iNext   *entry // local FIFO insertion order
+	gPrev, gNext   *entry // global LRU recency (strategy 1)
+	giPrev, giNext *entry // global FIFO insertion (strategy 1)
+	// LFU same-frequency list within a freqBucket.
+	fPrev, fNext *entry
 }
 
 type shard struct {
 	mu     sync.Mutex
 	data   map[string]*entry
 	used   uint64
-	budget uint64 // strategy 3
-	head   *entry // local LRU head = least recently used
-	tail   *entry
+	budget uint64
+	// Always-on: recency (LRU) and insertion (FIFO) lists.
+	head, tail         *entry
+	fifoHead, fifoTail *entry
+	// Always-on: random victim array.
+	rnd []*entry
+	// Always-on: LFU frequency buckets.
+	freqMap map[int]*freqBucket
+	lfuMin  *freqBucket
+	lfuSize int
+	// Always-on when keys have TTL: per-shard TTL min-heap.
+	ttlH   []expItem
+	ttlIdx map[string]int
 }
 
 // New creates a DB and starts the periodic expiry worker.
@@ -95,6 +118,12 @@ func New(cfg Config) *DB {
 	}
 	if cfg.Strategy < StrategyGlobalTrack || cfg.Strategy > StrategyShardBudget {
 		cfg.Strategy = StrategyGlobalTrack
+	}
+	if cfg.Policy == "" {
+		cfg.Policy = PolicyAllKeysLRU
+	}
+	if _, ok := ParseEvictionPolicy(string(cfg.Policy)); !ok {
+		cfg.Policy = PolicyAllKeysLRU
 	}
 	if cfg.ExpiryInterval <= 0 {
 		cfg.ExpiryInterval = time.Second
@@ -115,8 +144,10 @@ func New(cfg Config) *DB {
 			b++
 		}
 		db.shards[i] = &shard{
-			data:   make(map[string]*entry),
-			budget: b,
+			data:    make(map[string]*entry),
+			budget:  b,
+			freqMap: make(map[int]*freqBucket),
+			ttlIdx:  make(map[string]int),
 		}
 	}
 

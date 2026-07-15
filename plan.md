@@ -196,7 +196,8 @@ Use these as product contracts, not vague goals.
 - Documented memory accounting (what is charged).
 - Eviction policies per tenant, Redis-like names where useful:
   - `noeviction`, `allkeys-lru`, `allkeys-lfu`, `allkeys-random`
-  - volatile variants as needed
+  - `volatile-lru`, `volatile-lfu`, `volatile-random`, `volatile-ttl`
+  - **Extensions (not in stock Redis):** `allkeys-fifo`, `volatile-fifo`
 - Correct interaction: TTL expiry vs eviction under `maxmemory`.
 - Global process memory guardrails (sum of tenants vs host).
 - Optional fairness: max concurrent commands or simple rate limit per tenant.

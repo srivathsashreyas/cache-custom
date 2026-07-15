@@ -40,8 +40,8 @@ func main() {
 	fmt.Printf("Server is listening on %s (RESP2)\n", *addr)
 	fmt.Printf("Loaded %d tenant(s); AUTH <Name> <Password> required for data commands\n", tenants.Len())
 	for _, t := range tenants.All() {
-		fmt.Printf("  - %s appId=%d maxmemory=%d strategy=%d shards=%d\n",
-			t.Name, t.AppID, t.MaxMemory, int(t.Strategy), t.Shards)
+		fmt.Printf("  - %s appId=%d maxmemory=%d strategy=%d policy=%s shards=%d\n",
+			t.Name, t.AppID, t.MaxMemory, int(t.Strategy), t.Policy, t.Shards)
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
@@ -71,6 +71,7 @@ func toTenantConfigs(cfgs []Config) []tenant.Config {
 			MaxTTL:     maxTTL,
 			ShardCount: sc,
 			Strategy:   st,
+			Policy:     evictionFromConfig(c),
 			Disabled:   c.Disabled,
 		})
 	}
