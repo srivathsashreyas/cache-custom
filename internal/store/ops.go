@@ -233,6 +233,64 @@ func (db *DB) SetEvictionPolicy(p EvictionPolicy) {
 	db.cfg.Policy = p
 }
 
+// SetShardingStrategy changes how memory pressure is applied across shards.
+// Local indexes stay correct always; global LRU/FIFO lists are only maintained while
+// strategy is StrategyGlobalTrack. Switching into global rebuilds those lists from
+// per-shard state; switching out clears them.
+func (db *DB) SetShardingStrategy(s Strategy) {
+	if s < StrategyGlobalTrack || s > StrategyShardBudget {
+		s = StrategyGlobalTrack
+	}
+	if db.cfg.Strategy == s {
+		return
+	}
+
+	// Freeze all shards then gMu so rebuild cannot race with insert/evict
+	// (those use shard→gMu or shard-only lock orders).
+	for _, sh := range db.shards {
+		sh.mu.Lock()
+	}
+	db.gMu.Lock()
+
+	db.clearGlobalOrderListsLocked()
+	db.cfg.Strategy = s
+	if s == StrategyGlobalTrack {
+		db.rebuildGlobalOrderListsLocked()
+	}
+
+	db.gMu.Unlock()
+	for i := len(db.shards) - 1; i >= 0; i-- {
+		db.shards[i].mu.Unlock()
+	}
+}
+
+// clearGlobalOrderListsLocked clears global LRU/FIFO under gMu + all shard locks.
+func (db *DB) clearGlobalOrderListsLocked() {
+	for _, sh := range db.shards {
+		for e := sh.head; e != nil; e = e.lNext {
+			e.gPrev, e.gNext = nil, nil
+			e.giPrev, e.giNext = nil, nil
+		}
+	}
+	db.gHead, db.gTail = nil, nil
+	db.gFifoHead, db.gFifoTail = nil, nil
+}
+
+// rebuildGlobalOrderListsLocked repopulates global LRU/FIFO from per-shard lists.
+// Call only with every shard.mu and gMu held, after clearGlobalOrderListsLocked.
+func (db *DB) rebuildGlobalOrderListsLocked() {
+	for _, sh := range db.shards {
+		// Local LRU head→tail is LRU→MRU; pushTail preserves that relative order.
+		for e := sh.head; e != nil; e = e.lNext {
+			db.globalPushTail(e)
+		}
+		// Local FIFO head→tail is oldest→newest insertion.
+		for e := sh.fifoHead; e != nil; e = e.iNext {
+			db.globalFifoPushTail(e)
+		}
+	}
+}
+
 // ensureSpace requires sh.mu held on entry for target shard; may unlock/relock it.
 func (db *DB) ensureSpace(sh *shard, si int, key string, need, newSize uint64, exists bool) error {
 	// Hard ceiling: single entry larger than the limit cannot be stored.

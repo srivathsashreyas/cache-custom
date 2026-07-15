@@ -119,6 +119,48 @@ func TestLFUUnboundedFreqStillCorrect(t *testing.T) {
 	}
 }
 
+// Switching into StrategyGlobalTrack rebuilds global lists from local indexes.
+func TestShardingStrategySwitchRebuildsGlobalLists(t *testing.T) {
+	db := newPolicyDB(PolicyAllKeysFIFO, StrategySteal, 80, 2)
+	defer db.Close()
+
+	_, _ = db.Set("first", "xxxxxxxxxx", SetOptions{})
+	_, _ = db.Set("second", "xxxxxxxxxx", SetOptions{})
+	// Under steal, global lists are not maintained.
+	if db.gHead != nil || db.gFifoHead != nil {
+		t.Fatal("expected empty global lists under StrategySteal")
+	}
+
+	db.SetShardingStrategy(StrategyGlobalTrack)
+	if db.gFifoHead == nil || db.gHead == nil {
+		t.Fatal("global lists should be rebuilt after switch to StrategyGlobalTrack")
+	}
+
+	// Force eviction under global FIFO; oldest insert ("first") should go.
+	if _, err := db.Set("third", "xxxxxxxxxx", SetOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.Get("first"); ok {
+		t.Fatal("after global rebuild, FIFO should still evict oldest key")
+	}
+	if _, ok := db.Get("second"); !ok {
+		t.Fatal("second should remain")
+	}
+
+	// Switch back to local strategy and ensure eviction still works.
+	db.SetShardingStrategy(StrategyShardBudget)
+	if db.gHead != nil || db.gFifoHead != nil {
+		t.Fatal("global lists should be cleared when leaving StrategyGlobalTrack")
+	}
+	_, _ = db.Set("a", "xxxxxxxxxx", SetOptions{})
+	_, _ = db.Set("b", "xxxxxxxxxx", SetOptions{})
+	_, _ = db.Set("c", "xxxxxxxxxx", SetOptions{})
+	used, max, _, _, _, _ := db.Stats()
+	if used > max {
+		t.Fatalf("used %d > max %d", used, max)
+	}
+}
+
 // Access frequency is tracked under any policy; switching to LFU uses true history.
 func TestPolicySwitchLRUToLFUKeepsAccessFreq(t *testing.T) {
 	db := newPolicyDB(PolicyAllKeysLRU, StrategyGlobalTrack, 80, 1)
