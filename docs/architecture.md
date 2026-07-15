@@ -96,7 +96,7 @@ Dynamic tenant create/update at runtime is desirable later; M0 assumes **boot-ti
 Each tenant configures at least:
 
 - `maxmemory` (bytes)
-- Eviction policy per tenant: Redis-like names (`noeviction`, `allkeys-lru`/`lfu`/`random`, `volatile-*`) plus extensions `allkeys-fifo` / `volatile-fifo` (FIFO is not a stock Redis policy; random is)
+- Eviction policy per tenant: Redis-like names (`noeviction`, `allkeys-lru`/`lfu`/`random`, `volatile-*`) plus extensions `allkeys-fifo` / `volatile-fifo`. Indexes for all policies are **always maintained**; switching policy does not rebuild.
 - Max TTL ceiling (tenant-wide upper bound on per-key TTL)
 
 ### Per-key TTL

@@ -27,9 +27,10 @@ func (db *DB) Get(key string) (string, bool) {
 		db.misses.Add(1)
 		return "", false
 	}
-	movedLRU := db.touch(sh, e)
+	db.touch(sh, e)
 	val := e.value
-	needGlobal := movedLRU && db.cfg.Strategy == StrategyGlobalTrack
+	// Always-on global LRU recency (strategy 1); FIFO global list is insert-only.
+	needGlobal := db.cfg.Strategy == StrategyGlobalTrack
 	sh.mu.Unlock()
 
 	if needGlobal {
@@ -45,20 +46,19 @@ func (db *DB) Get(key string) (string, bool) {
 	return val, true
 }
 
-// touch updates eviction metadata for an accessed/updated entry (shard mu held).
-// Returns true if the local order list was reordered (LRU) so global list may need the same.
-func (db *DB) touch(sh *shard, e *entry) bool {
-	switch db.cfg.Policy {
-	case PolicyAllKeysLRU, PolicyVolatileLRU:
-		sh.lruTouch(e)
-		return true
-	case PolicyAllKeysLFU, PolicyVolatileLFU:
-		// Frequency tracks accesses always; structure membership is separate (see syncLFUMembership).
-		sh.lfuOnAccess(e)
-		return false
-	default:
-		// FIFO / random / TTL / noeviction: access does not change eviction order.
-		return false
+// touch updates all always-on access indexes (shard mu held).
+// Policy only selects the victim rule at eviction time; structures stay warm for seamless switch.
+func (db *DB) touch(sh *shard, e *entry) {
+	// Frequency (LFU history).
+	if e.freq <= 0 {
+		e.freq = 1
+	}
+	e.freq++
+	// Recency (LRU); FIFO insertion list is not moved here.
+	sh.lruTouch(e)
+	// LFU bucket position for current frequency.
+	if e.inLFU && e.bucket != nil {
+		sh.lfuRelocate(e)
 	}
 }
 
@@ -184,11 +184,9 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 			existing.expiresAt = expiresAt
 		}
 		finalExp := existing.expiresAt
-		// Volatile-LFU: join/leave LFU set when TTL appears/disappears.
-		db.syncLFUMembership(sh, existing)
 		sh.ttlUpdate(key, finalExp)
-		moved := db.touch(sh, existing)
-		if moved && db.cfg.Strategy == StrategyGlobalTrack {
+		db.touch(sh, existing)
+		if db.cfg.Strategy == StrategyGlobalTrack {
 			sh.mu.Unlock()
 			db.gMu.Lock()
 			if db.stillInGlobal(existing) {
@@ -207,16 +205,17 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 	sh.data[key] = e
 	sh.used += newSize
 	db.addUsed(newSize)
+	// Always-on indexes: recency, insertion order, random, LFU.
 	sh.lruPushTail(e)
+	sh.fifoPushTail(e)
 	sh.rndAdd(e)
-	if db.cfg.Policy.usesLFU() && db.cfg.Policy.eligible(e) {
-		sh.lfuAdd(e)
-	}
+	sh.lfuAdd(e)
 	sh.ttlUpdate(key, expiresAt)
 	if db.cfg.Strategy == StrategyGlobalTrack {
 		sh.mu.Unlock()
 		db.gMu.Lock()
 		db.globalPushTail(e)
+		db.globalFifoPushTail(e)
 		db.gMu.Unlock()
 		db.noteExpiry(key, expiresAt)
 		return true, nil
@@ -226,25 +225,12 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 	return true, nil
 }
 
-// syncLFUMembership joins/leaves the LFU *eviction index* based on policy eligibility
-// (e.g. volatile-lfu only indexes keys that currently have a TTL).
-// It does not reset or recompute e.freq: frequency is access history and is updated
-// by lfuOnAccess even while the entry is not indexed.
-func (db *DB) syncLFUMembership(sh *shard, e *entry) {
-	if !db.cfg.Policy.usesLFU() {
-		if e.inLFU {
-			sh.lfuRemove(e)
-		}
-		return
+// SetEvictionPolicy changes the maxmemory victim policy. Indexes are always-on, so this is O(1).
+func (db *DB) SetEvictionPolicy(p EvictionPolicy) {
+	if _, ok := ParseEvictionPolicy(string(p)); !ok || p == "" {
+		p = PolicyAllKeysLRU
 	}
-	want := db.cfg.Policy.eligible(e)
-	if want && !e.inLFU {
-		// Re-enter at true frequency (may be >> 1 after accesses while non-volatile).
-		sh.lfuAdd(e)
-	} else if !want && e.inLFU {
-		// Leave index only; keep e.freq for a future re-join.
-		sh.lfuRemove(e)
-	}
+	db.cfg.Policy = p
 }
 
 // ensureSpace requires sh.mu held on entry for target shard; may unlock/relock it.
@@ -378,11 +364,12 @@ func (db *DB) stealFromOtherShards(holdSI int, skipKey string) bool {
 	return false
 }
 
-// removeFromShard drops e from the shard map, order/random/LFU/TTL indexes, and tenant used.
-// sh.mu must be held. globalAlreadyUnlinked skips strategy-1 list unlink.
+// removeFromShard drops e from the shard map and all always-on indexes.
+// sh.mu must be held. globalAlreadyUnlinked skips strategy-1 list unlinks.
 func (db *DB) removeFromShard(sh *shard, e *entry, globalAlreadyUnlinked bool) {
 	delete(sh.data, e.key)
 	sh.lruRemove(e)
+	sh.fifoRemove(e)
 	sh.rndRemove(e)
 	if e.inLFU {
 		sh.lfuRemove(e)
@@ -399,6 +386,10 @@ func (db *DB) removeFromShard(sh *shard, e *entry, globalAlreadyUnlinked bool) {
 		db.gMu.Lock()
 		if db.stillInGlobal(e) {
 			db.globalRemove(e)
+		}
+		// FIFO global: unlink if still linked (head or has neighbors).
+		if db.gFifoHead == e || e.giPrev != nil || e.giNext != nil {
+			db.globalFifoRemove(e)
 		}
 		db.gMu.Unlock()
 	}
@@ -484,7 +475,6 @@ func (db *DB) setExpireAt(key string, at time.Time) int64 {
 		return 0
 	}
 	e.expiresAt = at
-	db.syncLFUMembership(sh, e)
 	sh.ttlUpdate(key, at)
 	sh.mu.Unlock()
 	db.noteExpiry(key, at)
@@ -513,7 +503,6 @@ func (db *DB) Persist(key string) int64 {
 		return 0
 	}
 	e.expiresAt = time.Time{}
-	db.syncLFUMembership(sh, e)
 	sh.ttlUpdate(key, time.Time{})
 	sh.mu.Unlock()
 	db.clearExpiry(key)

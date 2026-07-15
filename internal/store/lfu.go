@@ -38,28 +38,31 @@ func (sh *shard) lfuRemove(e *entry) {
 	}
 }
 
-// lfuOnAccess records one access against e.
-// Frequency always increases (access count), whether or not e is currently an
-// eviction candidate in the LFU structure (e.g. no TTL under volatile-lfu).
-// Bucket moves happen only while e.inLFU.
-func (sh *shard) lfuOnAccess(e *entry) {
-	if e.inLFU && e.bucket != nil {
-		oldB := e.bucket
-		oldB.detach(e)
-		e.freq++
-		// New bucket for freq+1 sits immediately after oldB when created (O(1) splice).
-		newB := sh.lfuGetOrCreateBucket(e.freq, oldB)
-		newB.pushTail(e)
-		if oldB.empty() {
-			sh.lfuUnlinkBucket(oldB)
-		}
+// lfuRelocate moves e to the frequency bucket for its current e.freq.
+// Caller must have already updated e.freq. Only valid when e.inLFU.
+// When the previous bucket is freq-1, new bucket creation is O(1) via after-hint.
+func (sh *shard) lfuRelocate(e *entry) {
+	if !e.inLFU || e.bucket == nil {
 		return
 	}
-	// Not in the structure: still track true access frequency for a later re-join.
-	if e.freq <= 0 {
-		e.freq = 1
+	oldB := e.bucket
+	// If already in the correct bucket (shouldn't happen after a +1), no-op.
+	if oldB.freq == e.freq {
+		// Move to tail within same freq (recency among equals).
+		oldB.detach(e)
+		oldB.pushTail(e)
+		return
 	}
-	e.freq++
+	oldB.detach(e)
+	var after *freqBucket
+	if oldB.freq+1 == e.freq {
+		after = oldB
+	}
+	newB := sh.lfuGetOrCreateBucket(e.freq, after)
+	newB.pushTail(e)
+	if oldB.empty() {
+		sh.lfuUnlinkBucket(oldB)
+	}
 }
 
 // lfuGetOrCreateBucket returns the bucket for freq.

@@ -15,8 +15,19 @@ func (db *DB) pickLocalVictim(sh *shard, skipKey string, now time.Time) *entry {
 	vol := pol.volatileOnly()
 
 	switch pol {
-	case PolicyAllKeysLRU, PolicyAllKeysFIFO, PolicyVolatileLRU, PolicyVolatileFIFO:
+	case PolicyAllKeysLRU, PolicyVolatileLRU:
 		for e := sh.head; e != nil; e = e.lNext {
+			if e.key == skipKey {
+				continue
+			}
+			if pol.eligible(e) {
+				return e
+			}
+		}
+		return nil
+
+	case PolicyAllKeysFIFO, PolicyVolatileFIFO:
+		for e := sh.fifoHead; e != nil; e = e.iNext {
 			if e.key == skipKey {
 				continue
 			}
@@ -53,9 +64,24 @@ func (db *DB) pickGlobalVictimKey(skipKey string, now time.Time) (key string, ok
 	}
 
 	switch pol {
-	case PolicyAllKeysLRU, PolicyAllKeysFIFO, PolicyVolatileLRU, PolicyVolatileFIFO:
+	case PolicyAllKeysLRU, PolicyVolatileLRU:
 		db.gMu.Lock()
 		for e := db.gHead; e != nil; e = e.gNext {
+			if e.key == skipKey {
+				continue
+			}
+			if pol.eligible(e) {
+				key = e.key
+				db.gMu.Unlock()
+				return key, true
+			}
+		}
+		db.gMu.Unlock()
+		return "", false
+
+	case PolicyAllKeysFIFO, PolicyVolatileFIFO:
+		db.gMu.Lock()
+		for e := db.gFifoHead; e != nil; e = e.giNext {
 			if e.key == skipKey {
 				continue
 			}

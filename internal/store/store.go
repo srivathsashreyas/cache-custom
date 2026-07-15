@@ -44,18 +44,22 @@ type Config struct {
 // Concurrency model (no single meta lock on the hot path):
 //   - each shard has its own mu (map + local LRU + shard used)
 //   - tenant-wide used memory is atomic
-//   - strategy 1 only: gMu protects the global LRU list (brief critical sections)
+//   - strategy 1 only: gMu protects global LRU/FIFO lists (brief critical sections)
 //   - expMu protects the expiry heap only
+// All eviction indexes (LRU, FIFO, LFU, random, TTL heaps) are maintained continuously
+// so SetEvictionPolicy is a flag flip without rebuild.
 type DB struct {
 	cfg    Config
 	shards []*shard
 
 	used atomic.Uint64
 
-	// Strategy 1: tenant-global recency/insertion list (not held across shard map ops).
-	gMu   sync.Mutex
-	gHead *entry
-	gTail *entry
+	// Strategy 1: always-on global recency + FIFO lists (not held across shard map ops).
+	gMu        sync.Mutex
+	gHead      *entry
+	gTail      *entry
+	gFifoHead  *entry
+	gFifoTail  *entry
 
 	expMu  sync.Mutex
 	expH   []expItem
@@ -74,14 +78,16 @@ type entry struct {
 	value     string
 	expiresAt time.Time // zero => no expiry
 	size      uint64
-	freq      int // LFU frequency (unbounded)
+	freq      int // LFU frequency (unbounded); always updated on access
 	inLFU     bool
 	rndIdx    int // index in shard.rnd (-1 if absent)
 	bucket    *freqBucket
 
-	// Order lists: local + global (strategy 1). Head = LRU/oldest FIFO.
-	lPrev, lNext *entry
-	gPrev, gNext *entry
+	// Always-on order indexes (policy only chooses which to read at eviction).
+	lPrev, lNext   *entry // local LRU recency
+	iPrev, iNext   *entry // local FIFO insertion order
+	gPrev, gNext   *entry // global LRU recency (strategy 1)
+	giPrev, giNext *entry // global FIFO insertion (strategy 1)
 	// LFU same-frequency list within a freqBucket.
 	fPrev, fNext *entry
 }
@@ -91,15 +97,16 @@ type shard struct {
 	data   map[string]*entry
 	used   uint64
 	budget uint64
-	// Order list (LRU / FIFO).
-	head, tail *entry
-	// Random victim array (O(1) pick).
+	// Always-on: recency (LRU) and insertion (FIFO) lists.
+	head, tail         *entry
+	fifoHead, fifoTail *entry
+	// Always-on: random victim array.
 	rnd []*entry
-	// LFU: map freq -> bucket; buckets form a DLL ordered by increasing freq.
+	// Always-on: LFU frequency buckets.
 	freqMap map[int]*freqBucket
-	lfuMin  *freqBucket // lowest-frequency non-empty bucket
+	lfuMin  *freqBucket
 	lfuSize int
-	// Per-shard TTL min-heap for local volatile-ttl eviction.
+	// Always-on when keys have TTL: per-shard TTL min-heap.
 	ttlH   []expItem
 	ttlIdx map[string]int
 }

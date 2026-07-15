@@ -119,6 +119,31 @@ func TestLFUUnboundedFreqStillCorrect(t *testing.T) {
 	}
 }
 
+// Access frequency is tracked under any policy; switching to LFU uses true history.
+func TestPolicySwitchLRUToLFUKeepsAccessFreq(t *testing.T) {
+	db := newPolicyDB(PolicyAllKeysLRU, StrategyGlobalTrack, 80, 1)
+	defer db.Close()
+
+	_, _ = db.Set("hot", "xxxxxxxxxx", SetOptions{})
+	_, _ = db.Set("cold", "xxxxxxxxxx", SetOptions{})
+	for i := 0; i < 40; i++ {
+		_, _ = db.Get("hot")
+	}
+	_, _ = db.Get("cold")
+
+	db.SetEvictionPolicy(PolicyAllKeysLFU)
+
+	if _, err := db.Set("other", "xxxxxxxxxx", SetOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.Get("cold"); ok {
+		t.Fatal("after switch to LFU, cold should be evicted (fewer accesses while on LRU)")
+	}
+	if _, ok := db.Get("hot"); !ok {
+		t.Fatal("hot should survive with higher access count accumulated under LRU")
+	}
+}
+
 // Accesses while a key is non-volatile (not in the LFU index) must still count.
 // After TTL is applied, it should re-join at its true frequency, not the pre-leave freq only.
 func TestVolatileLFUTracksFreqWhileNotIndexed(t *testing.T) {
