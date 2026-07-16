@@ -15,9 +15,12 @@ Docs: [docs/architecture.md](docs/architecture.md) · [docs/decisions.md](docs/d
 | String/TTL commands (require AUTH) | Persistence modes |
 | Lazy + periodic expiry; 3 shard strategies | GKE |
 | Per-tenant eviction policies (LRU/LFU/random/FIFO/…) | |
+| Tenant-scoped Pub/Sub (`SUBSCRIBE`/`PUBLISH`/…) | |
 | `INFO tenants` per-tenant stats | |
 
-Data commands require **`AUTH`**. Connectivity (`PING`/`ECHO`/`QUIT`/`COMMAND`/`INFO`) works without AUTH.
+Data and Pub/Sub commands require **`AUTH`**. Connectivity (`PING`/`ECHO`/`QUIT`/`COMMAND`/`INFO`) works without AUTH.
+
+While subscribed, only `(P)SUBSCRIBE` / `(P)UNSUBSCRIBE` / `PING` / `QUIT` are allowed (Redis subscribe-mode).
 
 ## Build and run
 
@@ -69,6 +72,7 @@ redis-cli -p 9001 AUTH App1 secret1
 redis-cli -p 9001 SET mykey hello
 redis-cli -p 9001 GET mykey
 redis-cli -p 9001 INFO tenants
+# Pub/Sub (two terminals): AUTH then SUBSCRIBE / PUBLISH
 # second tenant (isolated keyspace)
 redis-cli -p 9001 AUTH App2 secret2
 redis-cli -p 9001 GET mykey   # empty/nil — different tenant
@@ -81,6 +85,8 @@ go test ./...
 go test ./internal/store -v
 go test ./internal/command -run String -v
 go test ./internal/server -run GoRedis -v
+# go-redis Pub/Sub integration (Subscribe/Publish, PSubscribe, isolation)
+go test ./internal/server -run GoRedisPubSub -v
 ```
 
 ## Layout
@@ -92,5 +98,6 @@ internal/command/     # registry, AUTH, string commands
 internal/server/      # TCP RESP server (per-conn AUTH context)
 internal/store/       # sharded string store per tenant
 internal/tenant/      # tenant registry + authenticate
+internal/pubsub/      # per-tenant Pub/Sub hubs
 docs/
 ```

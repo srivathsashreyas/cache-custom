@@ -25,9 +25,9 @@ type Server struct {
 	ln net.Listener
 	wg sync.WaitGroup
 
-	mu       sync.Mutex
-	closed   bool
-	conns    map[net.Conn]struct{}
+	mu     sync.Mutex
+	closed bool
+	conns  map[net.Conn]struct{}
 }
 
 // New creates a server with the given listen address and command registry.
@@ -115,13 +115,32 @@ func (s *Server) untrack(c net.Conn) {
 	_ = c.Close()
 }
 
+// connWriter serializes command replies and Pub/Sub push messages on one connection.
+type connWriter struct {
+	mu sync.Mutex
+	bw *bufio.Writer
+}
+
+func (w *connWriter) WriteValue(v protocol.Value) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := protocol.Write(w.bw, v); err != nil {
+		return err
+	}
+	return w.bw.Flush()
+}
+
 // handleConn is the per-connection request loop.
-// One bufio.Reader is reused so pipelined commands (multiple frames already in the buffer) work.
 func (s *Server) handleConn(conn net.Conn) {
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
-	// Per-connection context so AUTH tenant binding persists across commands.
-	ctx := &command.Context{}
+	writer := &connWriter{bw: bw}
+	ctx := &command.Context{Writer: writer}
+	defer func() {
+		if ctx.PubSub != nil {
+			ctx.PubSub.Close()
+		}
+	}()
 
 	for {
 		if s.ReadTimeout > 0 {
@@ -130,23 +149,27 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		args, err := protocol.ReadCommand(br)
 		if err != nil {
-			// Normal disconnects are silent; true protocol errors get a best-effort -ERR then close.
 			if !isConnClosed(err) {
-				_ = protocol.Write(bw, protocol.ErrorValue("ERR protocol error: "+err.Error()))
-				_ = bw.Flush()
+				_ = writer.WriteValue(protocol.ErrorValue("ERR protocol error: " + err.Error()))
 				log.Printf("connection %s: %v", conn.RemoteAddr(), err)
 			}
 			return
 		}
 
+		ctx.Multi = nil
 		reply := s.Registry.Dispatch(ctx, args)
-		if err := protocol.Write(bw, reply); err != nil {
-			return
+		if len(ctx.Multi) > 0 {
+			for _, m := range ctx.Multi {
+				if err := writer.WriteValue(m); err != nil {
+					return
+				}
+			}
+			ctx.Multi = nil
+		} else {
+			if err := writer.WriteValue(reply); err != nil {
+				return
+			}
 		}
-		if err := bw.Flush(); err != nil {
-			return
-		}
-		// QUIT replies OK then drops the session (Redis-compatible).
 		if ctx.Quit {
 			return
 		}
@@ -170,7 +193,6 @@ func isConnClosed(err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
-	// net.OpError / partial close strings vary by platform.
 	var op *net.OpError
 	if errors.As(err, &op) && op.Err != nil {
 		msg := op.Err.Error()

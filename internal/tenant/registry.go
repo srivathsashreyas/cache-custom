@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"cache-custom/internal/pubsub"
 	"cache-custom/internal/store"
 )
 
@@ -40,6 +41,7 @@ type Tenant struct {
 	Password string
 	Status   Status
 	DB       *store.DB
+	PubSub   *pubsub.Hub
 
 	// Cached config for INFO/stats (limits do not change at runtime in M3).
 	MaxMemory uint64
@@ -103,6 +105,7 @@ func NewRegistry(cfgs []Config) (*Registry, error) {
 			Password:  c.Password,
 			Status:    status,
 			DB:        db,
+			PubSub:    pubsub.NewHub(),
 			MaxMemory: c.MaxMemory,
 			Strategy:  st,
 			Policy:    pol,

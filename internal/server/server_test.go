@@ -243,3 +243,60 @@ func TestServerAuthIsolation(t *testing.T) {
 		t.Fatalf("noauth %+v", v3)
 	}
 }
+
+func TestServerPubSubTwoConnections(t *testing.T) {
+	tenants, err := tenant.NewRegistry([]tenant.Config{
+		{Name: "App1", Password: "p1", MaxMemory: 1 << 20, Strategy: store.StrategyGlobalTrack, Policy: store.PolicyAllKeysLRU, ShardCount: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tenants.Close)
+	reg := command.NewRegistry()
+	command.RegisterDefaults(reg, tenants)
+	command.RegisterAuth(reg, tenants)
+	command.RegisterPubSub(reg)
+
+	s := New("127.0.0.1:0", reg)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	go func() { _ = s.Serve(ln) }()
+	t.Cleanup(func() { _ = s.Close() })
+
+	// wait listen
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	sub := dial(t, addr)
+	writeRaw(t, sub, "*3\r\n$4\r\nAUTH\r\n$4\r\nApp1\r\n$2\r\np1\r\n")
+	_ = readValue(t, sub)
+	writeRaw(t, sub, "*2\r\n$9\r\nSUBSCRIBE\r\n$3\r\nch1\r\n")
+	conf := readValue(t, sub)
+	if conf.Type != protocol.Array || conf.Array[0].Str != "subscribe" {
+		t.Fatalf("sub conf %+v", conf)
+	}
+
+	pub := dial(t, addr)
+	writeRaw(t, pub, "*3\r\n$4\r\nAUTH\r\n$4\r\nApp1\r\n$2\r\np1\r\n")
+	_ = readValue(t, pub)
+	writeRaw(t, pub, "*3\r\n$7\r\nPUBLISH\r\n$3\r\nch1\r\n$4\r\nping\r\n")
+	n := readValue(t, pub)
+	if n.Type != protocol.Integer || n.Int != 1 {
+		t.Fatalf("publish %+v", n)
+	}
+
+	msg := readValue(t, sub)
+	if msg.Type != protocol.Array || msg.Array[0].Str != "message" || msg.Array[2].Str != "ping" {
+		t.Fatalf("msg %+v", msg)
+	}
+}
