@@ -35,6 +35,7 @@ func main() {
 	command.RegisterDefaults(reg, tenants)
 	command.RegisterAuth(reg, tenants)
 	command.RegisterStringCommands(reg)
+	command.RegisterPubSub(reg)
 
 	srv := server.New(*addr, reg)
 	fmt.Printf("Server is listening on %s (RESP2)\n", *addr)

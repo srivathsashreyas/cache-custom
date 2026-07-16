@@ -44,6 +44,17 @@ func (r *Registry) Dispatch(ctx *Context, args []string) protocol.Value {
 		return protocol.ErrorValue("ERR empty command")
 	}
 	name := strings.ToUpper(args[0])
+	// Redis subscribe-mode: only (P)SUB/(P)UNSUB/PING/QUIT.
+	if ctx != nil && ctx.InSubscribeMode() {
+		switch name {
+		case "SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT":
+		default:
+			return protocol.ErrorValue(fmt.Sprintf(
+				"ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT are allowed in this context",
+				args[0],
+			))
+		}
+	}
 	r.mu.RLock()
 	h, ok := r.handlers[name]
 	r.mu.RUnlock()
@@ -74,6 +85,20 @@ func RegisterDefaults(r *Registry, tenants *tenant.Registry) {
 
 // ping: no arg → +PONG; one arg → bulk echo of that arg (Redis-compatible).
 func ping(ctx *Context, args []string) protocol.Value {
+	if len(args) > 2 {
+		return protocol.ErrorValue("ERR wrong number of arguments for 'ping' command")
+	}
+	// In subscribe mode Redis returns a multi-bulk pong.
+	if ctx != nil && ctx.InSubscribeMode() {
+		msg := ""
+		if len(args) == 2 {
+			msg = args[1]
+		}
+		return protocol.ArrayValue(
+			protocol.BulkStringValue("pong"),
+			protocol.BulkStringValue(msg),
+		)
+	}
 	switch len(args) {
 	case 1:
 		return protocol.SimpleStringValue("PONG")

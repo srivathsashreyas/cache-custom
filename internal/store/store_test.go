@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -188,20 +189,61 @@ func TestMgetStyle(t *testing.T) {
 func TestConcurrentGetsSets(t *testing.T) {
 	db := New(Config{MaxMemory: 1 << 20, ShardCount: 8, Strategy: StrategyGlobalTrack})
 	defer db.Close()
-	const n = 64
-	done := make(chan struct{}, n)
-	for i := 0; i < n; i++ {
-		i := i
-		go func() {
-			defer func() { done <- struct{}{} }()
-			k := fmt.Sprintf("ck%d", i)
-			for j := 0; j < 50; j++ {
-				_, _ = db.Set(k, fmt.Sprintf("v%d", j), SetOptions{})
-				_, _ = db.Get(k)
+	const (
+		workers = 64
+		iters   = 50
+	)
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			k := fmt.Sprintf("ck%d", id)
+			for j := 0; j < iters; j++ {
+				want := fmt.Sprintf("v%d", j)
+				ok, err := db.Set(k, want, SetOptions{})
+				if err != nil {
+					errCh <- fmt.Errorf("worker %d set j=%d: %w", id, j, err)
+					return
+				}
+				if !ok {
+					errCh <- fmt.Errorf("worker %d set j=%d: NX/XX blocked unexpectedly", id, j)
+					return
+				}
+				got, found := db.Get(k)
+				if !found {
+					errCh <- fmt.Errorf("worker %d get j=%d: missing key", id, j)
+					return
+				}
+				if got != want {
+					errCh <- fmt.Errorf("worker %d get j=%d: got %q want %q", id, j, got, want)
+					return
+				}
 			}
-		}()
+		}(i)
 	}
-	for i := 0; i < n; i++ {
-		<-done
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
+	}
+
+	// Final state: each worker's key holds the last written value.
+	for i := 0; i < workers; i++ {
+		k := fmt.Sprintf("ck%d", i)
+		want := fmt.Sprintf("v%d", iters-1)
+		got, found := db.Get(k)
+		if !found || got != want {
+			t.Errorf("final %s: found=%v got=%q want=%q", k, found, got, want)
+		}
+	}
+	// Keys should not exceed worker count under this workload.
+	if n := db.DBSize(); n != int64(workers) {
+		t.Errorf("DBSize=%d want %d", n, workers)
 	}
 }
