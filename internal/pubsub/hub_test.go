@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -100,19 +101,93 @@ func TestUnsubscribeAllExits(t *testing.T) {
 
 func TestConcurrentPublishSubscribe(t *testing.T) {
 	h := NewHub()
+	const workers = 32
+	const payload = "burst"
+
+	deliverers := make([]*memDeliverer, workers)
+	clients := make([]*Client, workers)
+	for i := 0; i < workers; i++ {
+		deliverers[i] = &memDeliverer{}
+		clients[i] = h.NewClient(deliverers[i])
+	}
+
+	// Concurrent subscribe — collect errors after Wait (t is not used inside goroutines).
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			c := h.NewClient(&memDeliverer{})
-			c.Subscribe("ch")
-			h.Publish("ch", "x")
-			c.Unsubscribe("ch")
-			c.Close()
-		}()
+			conf := clients[i].Subscribe("ch")
+			if len(conf) != 1 {
+				errCh <- fmt.Errorf("worker %d: subscribe confirms=%d", i, len(conf))
+				return
+			}
+			if conf[0].Kind != "subscribe" || conf[0].Name != "ch" {
+				errCh <- fmt.Errorf("worker %d: bad confirm %+v", i, conf[0])
+			}
+		}(i)
 	}
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
+	}
+
+	ns := h.NumSub("ch")
+	if len(ns) != 1 || ns[0] != int64(workers) {
+		t.Fatalf("NumSub after subscribe: %v want %d", ns, workers)
+	}
+
+	// Single publish should reach every subscriber (Deliver is synchronous).
+	got := h.Publish("ch", payload)
+	if got != workers {
+		t.Fatalf("Publish receivers=%d want %d", got, workers)
+	}
+	for i, d := range deliverers {
+		if d.len() < 1 {
+			t.Errorf("worker %d: expected at least one pushed message", i)
+			continue
+		}
+		// Last message should be the burst publish (subscribe confirms are not Deliver'd).
+		msg := d.msgs[d.len()-1]
+		if len(msg.Array) < 3 || msg.Array[0].Str != "message" || msg.Array[2].Str != payload {
+			t.Errorf("worker %d: bad message %+v", i, msg)
+		}
+	}
+
+	// Concurrent unsubscribe + close; hub must end empty.
+	errCh = make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conf := clients[i].Unsubscribe("ch")
+			if len(conf) != 1 || conf[0].Kind != "unsubscribe" {
+				errCh <- fmt.Errorf("worker %d: unsubscribe %+v", i, conf)
+				return
+			}
+			clients[i].Close()
+			if clients[i].InSubscribeMode() {
+				errCh <- fmt.Errorf("worker %d: still in subscribe mode after close", i)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	if ns := h.NumSub("ch"); len(ns) != 1 || ns[0] != 0 {
+		t.Fatalf("NumSub after cleanup: %v", ns)
+	}
+	if chs := h.Channels(""); len(chs) != 0 {
+		t.Fatalf("Channels after cleanup: %v", chs)
+	}
 }
 
 func TestPubSubIntrospection(t *testing.T) {
