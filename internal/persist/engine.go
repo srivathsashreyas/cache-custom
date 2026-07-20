@@ -3,6 +3,7 @@ package persist
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -42,7 +43,10 @@ type Engine struct {
 	lastSave atomic.Int64 // unix seconds
 	saving   atomic.Bool
 
-	// tenant name for AOF sink routing is set per-DB via TenantSink
+	// During AOF rewrite or hybrid SAVE, concurrent mutations dual-write into catchup
+	// under the same mu as AOF appends (no extra global lock on the data plane).
+	catchingUp bool
+	catchup    bytes.Buffer
 }
 
 // New creates an engine; call Open then Load.
@@ -149,14 +153,20 @@ func (e *Engine) appendAOF(tenantName string, m store.Mutation) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.aof == nil {
-		return nil
+	// Live AOF (may be nil briefly during swap).
+	if e.aof != nil {
+		if _, err := e.aof.Write(b); err != nil {
+			return err
+		}
+		if e.cfg.Fsync == FsyncAlways {
+			if err := e.aof.Sync(); err != nil {
+				return err
+			}
+		}
 	}
-	if _, err := e.aof.Write(b); err != nil {
-		return err
-	}
-	if e.cfg.Fsync == FsyncAlways {
-		return e.aof.Sync()
+	// Compaction window: also buffer so the new base+delta stays complete.
+	if e.catchingUp {
+		_, _ = e.catchup.Write(b)
 	}
 	return nil
 }
@@ -169,26 +179,38 @@ type snapTenant struct {
 	Keys []store.Record
 }
 
-// SaveSnapshot writes dump.ccs for all tenants. On hybrid/aof rewrite, truncates AOF after success.
+// SaveSnapshot writes dump.ccs for snapshot/hybrid modes.
+// Hybrid: dual-write AOF mutations into a catchup buffer for the whole export+write
+// window, then replace AOF with catchup only (no silent drop of concurrent writes).
+// AOF-only SAVE uses rewriteAOF with the same catchup pattern.
 func (e *Engine) SaveSnapshot(reg *tenant.Registry) error {
-	if e.cfg.Mode == ModeNone || e.cfg.Mode == ModeAOF {
-		// AOF-only: rewrite AOF from current dataset instead of binary snapshot.
-		if e.cfg.Mode == ModeAOF {
-			return e.rewriteAOF(reg)
-		}
+	if e.cfg.Mode == ModeNone {
 		return nil
 	}
+	// Single in-progress gate for SAVE/BGSAVE (covers snapshot, hybrid, and AOF rewrite).
 	if !e.saving.CompareAndSwap(false, true) {
 		return fmt.Errorf("ERR Background save already in progress")
 	}
 	defer e.saving.Store(false)
 
+	// One catchup window for AOF rewrite and hybrid SAVE (rewriteAOF does not start its own).
+	if e.cfg.Mode == ModeAOF || e.cfg.Mode == ModeSnapshotAndAOF {
+		e.beginCatchup()
+	}
+
+	if e.cfg.Mode == ModeAOF {
+		return e.rewriteAOF(reg)
+	}
+
 	if err := os.MkdirAll(e.cfg.Dir, 0o755); err != nil {
+		e.abortCatchup()
 		return err
 	}
+
 	tmp := e.snapPath() + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
+		e.abortCatchup()
 		return err
 	}
 
@@ -201,11 +223,11 @@ func (e *Engine) SaveSnapshot(reg *tenant.Registry) error {
 	if err != nil {
 		f.Close()
 		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
 	sum := crc32.ChecksumIEEE(body)
 
-	// header: magic(4) version(4) bodyLen(8) crc(4) body
 	hdr := make([]byte, 4+4+8+4)
 	copy(hdr[0:4], snapMagic)
 	binary.LittleEndian.PutUint32(hdr[4:8], snapVersion)
@@ -214,58 +236,93 @@ func (e *Engine) SaveSnapshot(reg *tenant.Registry) error {
 	if _, err := f.Write(hdr); err != nil {
 		f.Close()
 		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
 	if _, err := f.Write(body); err != nil {
 		f.Close()
 		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
 	if err := os.Rename(tmp, e.snapPath()); err != nil {
+		e.abortCatchup()
 		return err
 	}
 	e.lastSave.Store(time.Now().Unix())
 
-	// Hybrid: after snapshot, reset AOF tail.
 	if e.cfg.Mode == ModeSnapshotAndAOF {
-		return e.truncateAOF()
+		// Snapshot is the new base; AOF becomes only the dual-written delta.
+		return e.installCatchupAsAOF()
 	}
 	return nil
 }
 
-func (e *Engine) truncateAOF() error {
+func (e *Engine) beginCatchup() {
+	e.mu.Lock()
+	e.catchingUp = true
+	e.catchup.Reset()
+	e.mu.Unlock()
+}
+
+func (e *Engine) abortCatchup() {
+	e.mu.Lock()
+	e.catchingUp = false
+	e.catchup.Reset()
+	e.mu.Unlock()
+}
+
+// installCatchupAsAOF replaces the live AOF with the catchup buffer contents only.
+// Holds e.mu for the swap; writers block only for the rename window (same as any AOF write).
+func (e *Engine) installCatchupAsAOF() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	delta := append([]byte(nil), e.catchup.Bytes()...)
+	e.catchingUp = false
+	e.catchup.Reset()
+
 	if e.aof != nil {
 		_ = e.aof.Close()
 		e.aof = nil
 	}
-	f, err := os.OpenFile(e.aofPath(), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	tmp := e.aofPath() + ".tmp"
+	if err := os.WriteFile(tmp, delta, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, e.aofPath()); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(e.aofPath(), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
 	e.aof = f
+	if e.cfg.Fsync == FsyncAlways {
+		return e.aof.Sync()
+	}
 	return nil
 }
 
+// rewriteAOF rebuilds appendonly.aof from the live dataset (AOF-only SAVE).
+// Concurrent writes dual-write into catchup and are appended before the atomic rename.
+// Caller (SaveSnapshot) must already hold the saving flag and have called beginCatchup.
 func (e *Engine) rewriteAOF(reg *tenant.Registry) error {
-	if !e.saving.CompareAndSwap(false, true) {
-		return fmt.Errorf("ERR Background save already in progress")
-	}
-	defer e.saving.Store(false)
-
 	tmp := e.aofPath() + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
+		e.abortCatchup()
 		return err
 	}
 	w := bufio.NewWriter(f)
@@ -279,11 +336,13 @@ func (e *Engine) rewriteAOF(reg *tenant.Registry) error {
 			if err != nil {
 				f.Close()
 				os.Remove(tmp)
+				e.abortCatchup()
 				return err
 			}
 			if _, err := w.Write(append(b, '\n')); err != nil {
 				f.Close()
 				os.Remove(tmp)
+				e.abortCatchup()
 				return err
 			}
 		}
@@ -291,32 +350,52 @@ func (e *Engine) rewriteAOF(reg *tenant.Registry) error {
 	if err := w.Flush(); err != nil {
 		f.Close()
 		os.Remove(tmp)
+		e.abortCatchup()
+		return err
+	}
+
+	// Serialize catchup drain + rename so no write is lost between export and cutover.
+	e.mu.Lock()
+	if _, err := f.Write(e.catchup.Bytes()); err != nil {
+		e.mu.Unlock()
+		f.Close()
+		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
 	if err := f.Sync(); err != nil {
+		e.mu.Unlock()
 		f.Close()
 		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
 	if err := f.Close(); err != nil {
+		e.mu.Unlock()
 		os.Remove(tmp)
+		e.abortCatchup()
 		return err
 	}
-	e.mu.Lock()
 	if e.aof != nil {
 		_ = e.aof.Close()
 		e.aof = nil
 	}
 	if err := os.Rename(tmp, e.aofPath()); err != nil {
+		e.catchingUp = false
+		e.catchup.Reset()
 		e.mu.Unlock()
 		return err
 	}
 	nf, err := os.OpenFile(e.aofPath(), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
+		e.catchingUp = false
+		e.catchup.Reset()
 		e.mu.Unlock()
 		return err
 	}
 	e.aof = nf
+	e.catchingUp = false
+	e.catchup.Reset()
 	e.mu.Unlock()
 	e.lastSave.Store(time.Now().Unix())
 	return nil
@@ -327,11 +406,9 @@ func (e *Engine) BGSave(reg *tenant.Registry) error {
 	if e.cfg.Mode == ModeNone {
 		return fmt.Errorf("ERR Persistence disabled")
 	}
-	if !e.saving.CompareAndSwap(false, true) {
+	if e.saving.Load() {
 		return fmt.Errorf("ERR Background save already in progress")
 	}
-	// SaveSnapshot also tries CAS — release and let it acquire, or inline.
-	e.saving.Store(false)
 	go func() { _ = e.SaveSnapshot(reg) }()
 	return nil
 }

@@ -100,7 +100,7 @@ Server config may be a tenant array (persistence `none`) or:
 | `none` | process loss loses all data |
 | `snapshot` | last `SAVE`/`BGSAVE` (or interval) |
 | `aof` | last fsync (`always` / `everysec` ≈1s / `no`) |
-| `snapshot+aof` | snapshot base + AOF tail; SAVE rewrites snapshot and truncates AOF |
+| `snapshot+aof` | snapshot base + AOF delta since last SAVE; SAVE writes a new snapshot and compacts AOF to the concurrent-write catchup buffer (not a blind truncate) |
 
 Commands (AUTH required): `SAVE`, `BGSAVE`, `LASTSAVE`, `FLUSHDB` (current tenant).  
 Corruption: invalid snapshot magic/version/CRC **refuses load**. Unknown tenant names in snapshot/AOF are skipped.  
