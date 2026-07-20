@@ -183,7 +183,7 @@ Configurable modes (Redis-like product surface):
 
 Format need **not** be byte-compatible with Redis RDB/AOF files. Semantic durability and multi-tenant restore matter more.
 
-Default recommendation: `none` in development; document production toward `aof` or `snapshot+aof` depending on RPO needs.
+Default recommendation: `none` in development; production toward `aof` or `snapshot+aof`. Custom versioned snapshot (`dump.ccs` + CRC) and JSON-line AOF under `Persistence.Dir`; Pub/Sub is not durable.
 
 HA/replication is **out of v1**; persistence is single-node disk recovery.
 

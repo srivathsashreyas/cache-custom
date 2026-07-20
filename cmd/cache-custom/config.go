@@ -4,66 +4,105 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"time"
 
+	"cache-custom/internal/persist"
 	"cache-custom/internal/store"
 )
 
-// Config is one tenant entry in config.json.
-type Config struct {
-	// Name is the AUTH username.
-	Name string
-	// Password is the AUTH secret (required).
-	Password string
-	AppId    uint64
-	// MaxMemory is the tenant memory budget in bytes.
-	MaxMemory uint64
-	// EvictionPolicy: Redis-like name (+ allkeys-fifo / volatile-fifo). Empty => allkeys-lru.
-	// Supported: noeviction, allkeys-lru, allkeys-lfu, allkeys-random, allkeys-fifo,
-	// volatile-lru, volatile-lfu, volatile-random, volatile-ttl, volatile-fifo.
-	EvictionPolicy string
-	// MaxTTL is the ceiling for per-key TTL in seconds (0 = no ceiling).
-	MaxTTL int64
-	// ShardCount is the number of intra-node shards (default 4).
-	ShardCount int
-	// ShardingStrategy: 1=global eviction track, 2=steal across shards, 3=per-shard budget.
+// TenantConfig is one tenant entry.
+type TenantConfig struct {
+	Name             string
+	Password         string
+	AppId            uint64
+	MaxMemory        uint64
+	EvictionPolicy   string
+	MaxTTL           int64
+	ShardCount       int
 	ShardingStrategy int
-	// Disabled rejects AUTH for this tenant when true.
-	Disabled bool
+	Disabled         bool
 }
 
-func readConfig(path string) ([]Config, error) {
-	f, err := os.ReadFile(path)
+// PersistConfig is server-level durability settings.
+type PersistConfig struct {
+	Mode                 string // none | snapshot | aof | snapshot+aof
+	Dir                  string
+	AOFFsync             string // always | everysec | no
+	SnapshotIntervalSec  int    // 0 = manual only
+}
+
+// ServerConfig is the on-disk config file (object form).
+type ServerConfig struct {
+	Persistence PersistConfig
+	Tenants     []TenantConfig
+}
+
+// Config is an alias used by older call sites (tenant only).
+type Config = TenantConfig
+
+func readConfig(path string) (ServerConfig, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return ServerConfig{}, err
 	}
-	var configs []Config
-	if err := json.Unmarshal(f, &configs); err != nil {
-		return nil, err
+	// Backward compatible: bare tenant array.
+	var arr []TenantConfig
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+		return ServerConfig{Tenants: arr, Persistence: PersistConfig{Mode: "none"}}, validate(ServerConfig{Tenants: arr})
 	}
-	for i := range configs {
-		if configs[i].Name == "" {
-			return nil, errors.New("each tenant requires Name")
+	var sc ServerConfig
+	if err := json.Unmarshal(raw, &sc); err != nil {
+		return ServerConfig{}, err
+	}
+	return sc, validate(sc)
+}
+
+func validate(sc ServerConfig) error {
+	if len(sc.Tenants) == 0 {
+		return errors.New("at least one tenant required")
+	}
+	if sc.Persistence.Mode != "" {
+		if _, ok := persist.ParseMode(sc.Persistence.Mode); !ok {
+			return errors.New("invalid Persistence.Mode")
 		}
-		if configs[i].Password == "" {
-			return nil, errors.New("each tenant requires Password")
+	}
+	for i := range sc.Tenants {
+		c := &sc.Tenants[i]
+		if c.Name == "" {
+			return errors.New("each tenant requires Name")
 		}
-		if configs[i].EvictionPolicy != "" {
-			if _, ok := store.ParseEvictionPolicy(configs[i].EvictionPolicy); !ok {
-				return nil, errors.New("invalid EvictionPolicy for tenant " + configs[i].Name)
+		if c.Password == "" {
+			return errors.New("each tenant requires Password")
+		}
+		if c.EvictionPolicy != "" {
+			if _, ok := store.ParseEvictionPolicy(c.EvictionPolicy); !ok {
+				return errors.New("invalid EvictionPolicy for tenant " + c.Name)
 			}
 		}
-		if configs[i].ShardCount < 0 {
-			return nil, errors.New("ShardCount must be >= 0")
+		if c.ShardCount < 0 {
+			return errors.New("ShardCount must be >= 0")
 		}
-		if configs[i].ShardingStrategy != 0 &&
-			(configs[i].ShardingStrategy < 1 || configs[i].ShardingStrategy > 3) {
-			return nil, errors.New("ShardingStrategy must be 1, 2, or 3")
+		if c.ShardingStrategy != 0 && (c.ShardingStrategy < 1 || c.ShardingStrategy > 3) {
+			return errors.New("ShardingStrategy must be 1, 2, or 3")
 		}
 	}
-	return configs, nil
+	return nil
 }
 
-func evictionFromConfig(c Config) store.EvictionPolicy {
+func evictionFromConfig(c TenantConfig) store.EvictionPolicy {
 	p, _ := store.ParseEvictionPolicy(c.EvictionPolicy)
 	return p
+}
+
+func persistConfigFrom(pc PersistConfig) persist.Config {
+	mode, _ := persist.ParseMode(pc.Mode)
+	cfg := persist.Config{
+		Mode:  mode,
+		Dir:   pc.Dir,
+		Fsync: persist.ParseFsync(pc.AOFFsync),
+	}
+	if pc.SnapshotIntervalSec > 0 {
+		cfg.SnapshotInterval = time.Duration(pc.SnapshotIntervalSec) * time.Second
+	}
+	return cfg
 }

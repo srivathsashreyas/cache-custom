@@ -16,6 +16,7 @@ Docs: [docs/architecture.md](docs/architecture.md) · [docs/decisions.md](docs/d
 | Lazy + periodic expiry; 3 shard strategies | GKE |
 | Per-tenant eviction policies (LRU/LFU/random/FIFO/…) | |
 | Tenant-scoped Pub/Sub (`SUBSCRIBE`/`PUBLISH`/…) | |
+| Persistence: `none` / `snapshot` / `aof` / `snapshot+aof` | |
 | `INFO tenants` per-tenant stats | |
 
 Data and Pub/Sub commands require **`AUTH`**. Connectivity (`PING`/`ECHO`/`QUIT`/`COMMAND`/`INFO`) works without AUTH.
@@ -77,6 +78,33 @@ redis-cli -p 9001 INFO tenants
 redis-cli -p 9001 AUTH App2 secret2
 redis-cli -p 9001 GET mykey   # empty/nil — different tenant
 ```
+
+## Persistence
+
+Server config may be a tenant array (persistence `none`) or:
+
+```json
+{
+  "Persistence": {
+    "Mode": "snapshot",
+    "Dir": "data",
+    "AOFFsync": "everysec",
+    "SnapshotIntervalSec": 0
+  },
+  "Tenants": [ ... ]
+}
+```
+
+| Mode | RPO (approx) |
+|------|----------------|
+| `none` | process loss loses all data |
+| `snapshot` | last `SAVE`/`BGSAVE` (or interval) |
+| `aof` | last fsync (`always` / `everysec` ≈1s / `no`) |
+| `snapshot+aof` | snapshot base + AOF tail; SAVE rewrites snapshot and truncates AOF |
+
+Commands (AUTH required): `SAVE`, `BGSAVE`, `LASTSAVE`, `FLUSHDB` (current tenant).  
+Corruption: invalid snapshot magic/version/CRC **refuses load**. Unknown tenant names in snapshot/AOF are skipped.  
+See `config.persist.example.json`.
 
 ## Tests
 
