@@ -1,8 +1,8 @@
 {
   "Persistence": {
-    "Mode": "snapshot+aof",
-    "Dir": "data-snapshot-aof",
-    "AOFFsync": "everysec",
+    "Mode": "aof",
+    "Dir": "data-aof",
+    "AOFFsync": "always",
     "SnapshotIntervalSec": 0
   },
   "Tenants": [

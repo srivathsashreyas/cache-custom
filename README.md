@@ -104,7 +104,7 @@ Server config may be a tenant array (persistence `none`) or:
 
 Commands (AUTH required): `SAVE`, `BGSAVE`, `LASTSAVE`, `FLUSHDB` (current tenant).  
 Corruption: invalid snapshot magic/version/CRC **refuses load**. Unknown tenant names in snapshot/AOF are skipped.  
-See `config.persist.example.json`.
+Ready-made configs: `configs/persist-none.json`, `configs/persist-snapshot.json`, `configs/persist-aof.json`, `configs/persist-snapshot-aof.json` (each uses its own `data-*` dir). Also `config.persist.example.json`.
 
 ## Tests
 

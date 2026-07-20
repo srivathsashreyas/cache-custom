@@ -1,1 +1,12 @@
+# binary
 go_cache
+
+# persistence data (per-mode dirs + generic names)
+data/
+data-*/
+dump.ccs
+appendonly.aof
+*.ccs
+*.ccs.tmp
+*.aof
+*.aof.tmp

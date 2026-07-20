@@ -1,7 +1,7 @@
 {
   "Persistence": {
-    "Mode": "snapshot+aof",
-    "Dir": "data-snapshot-aof",
+    "Mode": "snapshot",
+    "Dir": "data-snapshot",
     "AOFFsync": "everysec",
     "SnapshotIntervalSec": 0
   },
