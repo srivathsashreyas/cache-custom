@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"cache-custom/internal/command"
+	"cache-custom/internal/persist"
 	"cache-custom/internal/server"
 	"cache-custom/internal/store"
 	"cache-custom/internal/tenant"
@@ -14,42 +15,53 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":9001", "TCP listen address for RESP")
-	configPath := flag.String("config", "config.json", "path to tenant config file")
+	configPath := flag.String("config", "config.json", "path to config file")
 	flag.Parse()
 
-	configs, err := readConfig(*configPath)
+	sc, err := readConfig(*configPath)
 	if err != nil {
 		log.Fatal("Error reading config file:", err)
 	}
-	if len(configs) == 0 {
-		log.Fatal("config must define at least one tenant")
-	}
 
-	tenants, err := tenant.NewRegistry(toTenantConfigs(configs))
+	tenants, err := tenant.NewRegistry(toTenantConfigs(sc.Tenants))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer tenants.Close()
+
+	eng := persist.New(persistConfigFrom(sc.Persistence))
+	if err := eng.Open(); err != nil {
+		log.Fatal("persist open:", err)
+	}
+	defer eng.Close()
+
+	if err := eng.Load(tenants); err != nil {
+		log.Fatal("persist load:", err)
+	}
+	eng.AttachSinks(tenants)
+	eng.StartPeriodicSnapshots(tenants)
 
 	reg := command.NewRegistry()
 	command.RegisterDefaults(reg, tenants)
 	command.RegisterAuth(reg, tenants)
 	command.RegisterStringCommands(reg)
 	command.RegisterPubSub(reg)
+	command.RegisterPersist(reg, eng, tenants)
 
 	srv := server.New(*addr, reg)
 	fmt.Printf("Server is listening on %s (RESP2)\n", *addr)
+	fmt.Printf("Persistence mode=%s dir=%s\n", eng.Mode(), sc.Persistence.Dir)
 	fmt.Printf("Loaded %d tenant(s); AUTH <Name> <Password> required for data commands\n", tenants.Len())
 	for _, t := range tenants.All() {
-		fmt.Printf("  - %s appId=%d maxmemory=%d strategy=%d policy=%s shards=%d\n",
-			t.Name, t.AppID, t.MaxMemory, int(t.Strategy), t.Policy, t.Shards)
+		fmt.Printf("  - %s appId=%d maxmemory=%d strategy=%d policy=%s shards=%d keys≈%d\n",
+			t.Name, t.AppID, t.MaxMemory, int(t.Strategy), t.Policy, t.Shards, t.DB.DBSize())
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func toTenantConfigs(cfgs []Config) []tenant.Config {
+func toTenantConfigs(cfgs []TenantConfig) []tenant.Config {
 	out := make([]tenant.Config, 0, len(cfgs))
 	for _, c := range cfgs {
 		sc := c.ShardCount

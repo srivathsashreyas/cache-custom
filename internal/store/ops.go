@@ -194,10 +194,12 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 			}
 			db.gMu.Unlock()
 			db.noteExpiry(key, finalExp)
+			db.emit(Mutation{Op: "SET", Key: key, Value: value, ExpiresAt: finalExp})
 			return true, nil
 		}
 		sh.mu.Unlock()
 		db.noteExpiry(key, finalExp)
+		db.emit(Mutation{Op: "SET", Key: key, Value: value, ExpiresAt: finalExp})
 		return true, nil
 	}
 
@@ -218,10 +220,12 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 		db.globalFifoPushTail(e)
 		db.gMu.Unlock()
 		db.noteExpiry(key, expiresAt)
+		db.emit(Mutation{Op: "SET", Key: key, Value: value, ExpiresAt: expiresAt})
 		return true, nil
 	}
 	sh.mu.Unlock()
 	db.noteExpiry(key, expiresAt)
+	db.emit(Mutation{Op: "SET", Key: key, Value: value, ExpiresAt: expiresAt})
 	return true, nil
 }
 
@@ -472,6 +476,7 @@ func (db *DB) Del(keys ...string) int64 {
 		db.clearExpiry(key)
 		if !expired {
 			n++
+			db.emit(Mutation{Op: "DEL", Keys: []string{key}})
 		}
 	}
 	return n
@@ -536,6 +541,7 @@ func (db *DB) setExpireAt(key string, at time.Time) int64 {
 	sh.ttlUpdate(key, at)
 	sh.mu.Unlock()
 	db.noteExpiry(key, at)
+	db.emit(Mutation{Op: "EXPIRE", Key: key, ExpiresAt: at})
 	return 1
 }
 
@@ -564,6 +570,7 @@ func (db *DB) Persist(key string) int64 {
 	sh.ttlUpdate(key, time.Time{})
 	sh.mu.Unlock()
 	db.clearExpiry(key)
+	db.emit(Mutation{Op: "PERSIST", Key: key})
 	return 1
 }
 

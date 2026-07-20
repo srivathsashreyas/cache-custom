@@ -71,6 +71,8 @@ type DB struct {
 	hits      atomic.Uint64
 	misses    atomic.Uint64
 	evictions atomic.Uint64
+
+	sink MutationSink
 }
 
 type entry struct {

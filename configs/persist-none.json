@@ -1,0 +1,30 @@
+{
+  "Persistence": {
+    "Mode": "none",
+    "Dir": "data-none",
+    "AOFFsync": "everysec",
+    "SnapshotIntervalSec": 0
+  },
+  "Tenants": [
+    {
+      "Name": "App1",
+      "Password": "secret1",
+      "AppId": 1,
+      "MaxMemory": 1048576,
+      "EvictionPolicy": "allkeys-lru",
+      "MaxTTL": 3600,
+      "ShardCount": 4,
+      "ShardingStrategy": 1
+    },
+    {
+      "Name": "App2",
+      "Password": "secret2",
+      "AppId": 2,
+      "MaxMemory": 65536,
+      "EvictionPolicy": "allkeys-fifo",
+      "MaxTTL": 3600,
+      "ShardCount": 4,
+      "ShardingStrategy": 2
+    }
+  ]
+}
