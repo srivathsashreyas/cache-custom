@@ -10,3 +10,6 @@ appendonly.aof
 *.ccs.tmp
 *.aof
 *.aof.tmp
+
+# local TLS material (see config.security.example.json)
+certs/

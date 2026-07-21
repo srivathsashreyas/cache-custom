@@ -20,11 +20,20 @@ type Registry struct {
 	handlers map[string]Handler
 	// names preserves registration order for COMMAND.
 	names []string
+	// Policy optional security policy (M7); nil = no extra checks beyond handlers.
+	Policy *Policy
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{handlers: make(map[string]Handler)}
+}
+
+// SetPolicy installs a security policy used by Dispatch.
+func (r *Registry) SetPolicy(p *Policy) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Policy = p
 }
 
 // Register adds a command handler. Name is matched case-insensitively.
@@ -56,10 +65,14 @@ func (r *Registry) Dispatch(ctx *Context, args []string) protocol.Value {
 		}
 	}
 	r.mu.RLock()
+	pol := r.Policy
 	h, ok := r.handlers[name]
 	r.mu.RUnlock()
 	if !ok {
 		return protocol.ErrorValue(fmt.Sprintf("ERR unknown command '%s'", args[0]))
+	}
+	if errv := pol.checkPolicy(ctx, name); errv.Type == protocol.Error {
+		return errv
 	}
 	return h(ctx, args)
 }

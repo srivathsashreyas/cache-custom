@@ -30,6 +30,8 @@ type Config struct {
 	ShardCount int
 	Strategy   store.Strategy
 	Policy     store.EvictionPolicy
+	// MaxClients is the max simultaneous connections bound to this tenant (0 = unlimited).
+	MaxClients int
 	// Disabled tenants reject AUTH and data commands if already bound.
 	Disabled bool
 }
@@ -44,10 +46,15 @@ type Tenant struct {
 	PubSub   *pubsub.Hub
 
 	// Cached config for INFO/stats (limits do not change at runtime in M3).
-	MaxMemory uint64
-	Strategy  store.Strategy
-	Policy    store.EvictionPolicy
-	Shards    int
+	MaxMemory  uint64
+	Strategy   store.Strategy
+	Policy     store.EvictionPolicy
+	Shards     int
+	MaxClients int // 0 = unlimited
+
+	// live connection count for this tenant (AUTH-bound sessions).
+	connMu    sync.Mutex
+	connCount int
 }
 
 // Registry holds all tenants loaded from config.
@@ -100,16 +107,17 @@ func NewRegistry(cfgs []Config) (*Registry, error) {
 			status = StatusDisabled
 		}
 		t := &Tenant{
-			Name:      c.Name,
-			AppID:     c.AppID,
-			Password:  c.Password,
-			Status:    status,
-			DB:        db,
-			PubSub:    pubsub.NewHub(),
-			MaxMemory: c.MaxMemory,
-			Strategy:  st,
-			Policy:    pol,
-			Shards:    sc,
+			Name:       c.Name,
+			AppID:      c.AppID,
+			Password:   c.Password,
+			Status:     status,
+			DB:         db,
+			PubSub:     pubsub.NewHub(),
+			MaxMemory:  c.MaxMemory,
+			Strategy:   st,
+			Policy:     pol,
+			Shards:     sc,
+			MaxClients: c.MaxClients,
 		}
 		r.byName[c.Name] = t
 		r.order = append(r.order, t)
@@ -165,4 +173,41 @@ func (r *Registry) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.order)
+}
+
+// AcquireConn reserves a connection slot for this tenant.
+// Returns false if MaxClients is set and already at the limit.
+func (t *Tenant) AcquireConn() bool {
+	if t == nil {
+		return false
+	}
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.MaxClients > 0 && t.connCount >= t.MaxClients {
+		return false
+	}
+	t.connCount++
+	return true
+}
+
+// ReleaseConn frees a connection slot previously acquired with AcquireConn.
+func (t *Tenant) ReleaseConn() {
+	if t == nil {
+		return
+	}
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.connCount > 0 {
+		t.connCount--
+	}
+}
+
+// ConnCount returns the number of AUTH-bound connections for this tenant.
+func (t *Tenant) ConnCount() int {
+	if t == nil {
+		return 0
+	}
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	return t.connCount
 }
