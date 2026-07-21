@@ -175,3 +175,15 @@ None yet. To change a decision, add a new ID that references the old one and set
 | **Context** | M4 needs Redis-like maxmemory policies; product also wants FIFO. |
 | **Decision** | Support Redis names: `noeviction`, `allkeys-lru`/`lfu`/`random`, `volatile-lru`/`lfu`/`random`/`ttl`. **Additionally** `allkeys-fifo` and `volatile-fifo` (not in stock Redis). Random **is** a Redis policy; FIFO is not. |
 | **Consequences** | Config field `EvictionPolicy` only. All eviction indexes (LRU recency, FIFO insertion, LFU buckets, random array, TTL heaps) are **always maintained**; policy only selects the victim rule. `SetEvictionPolicy` is O(1). Load-test later if always-on cost matters. |
+
+---
+
+## D015 — Security profiles, TLS, connection limits (M7)
+
+| | |
+|--|--|
+| **Date** | 2026-07-20 |
+| **Status** | Accepted |
+| **Context** | Shared and GKE environments need auth enforcement, optional TLS, and connection caps without an admin Redis user. |
+| **Decision** | Config `Security` section: **profiles** `local` \| `protected` (object-form default `protected`). **RequireAuth** defaults true for protected; false for local (auto-bind first tenant for data commands). Unauthenticated allowlist when auth required: `AUTH`, `PING`, `ECHO`, `QUIT`, `COMMAND`, `INFO`. **TLS** via `TLSCertFile`/`TLSKeyFile` (optional client CA). **MaxClients** global + per-tenant. **DenyCommands** config denylist (`AUTH`/`PING`/`QUIT` never deniable). No admin user (D003). |
+| **Consequences** | Bare tenant-array configs keep AUTH required. Protected configs refuse data without AUTH. TLS is opt-in via cert paths. Connection slots acquired on successful AUTH and released on disconnect. |

@@ -41,20 +41,64 @@ func main() {
 	eng.AttachSinks(tenants)
 	eng.StartPeriodicSnapshots(tenants)
 
+	requireAuth := resolveRequireAuth(sc.Security)
+	var defaultTenant *tenant.Tenant
+	if !requireAuth {
+		all := tenants.All()
+		if len(all) > 0 {
+			defaultTenant = all[0]
+		}
+	}
+	pol := command.NewPolicy(requireAuth, defaultTenant, sc.Security.DenyCommands)
+
 	reg := command.NewRegistry()
+	reg.SetPolicy(pol)
 	command.RegisterDefaults(reg, tenants)
 	command.RegisterAuth(reg, tenants)
 	command.RegisterStringCommands(reg)
 	command.RegisterPubSub(reg)
 	command.RegisterPersist(reg, eng, tenants)
 
-	srv := server.New(*addr, reg)
-	fmt.Printf("Server is listening on %s (RESP2)\n", *addr)
+	tlsCfg, err := loadTLSConfig(sc.Security)
+	if err != nil {
+		log.Fatal("tls:", err)
+	}
+	var idle time.Duration
+	if sc.Security.IdleTimeoutSec > 0 {
+		idle = time.Duration(sc.Security.IdleTimeoutSec) * time.Second
+	}
+	opts := server.Options{
+		TLSConfig:   tlsCfg,
+		MaxClients:  sc.Security.MaxClients,
+		IdleTimeout: idle,
+	}
+	srv := server.NewWithOptions(*addr, reg, opts)
+
+	profile := sc.Security.Profile
+	if profile == "" {
+		profile = "protected"
+	}
+	tlsOn := tlsCfg != nil
+	fmt.Printf("Server is listening on %s (RESP2) tls=%v profile=%s require_auth=%v\n",
+		*addr, tlsOn, profile, requireAuth)
 	fmt.Printf("Persistence mode=%s dir=%s\n", eng.Mode(), sc.Persistence.Dir)
-	fmt.Printf("Loaded %d tenant(s); AUTH <Name> <Password> required for data commands\n", tenants.Len())
+	if sc.Security.MaxClients > 0 {
+		fmt.Printf("MaxClients global=%d\n", sc.Security.MaxClients)
+	}
+	if len(sc.Security.DenyCommands) > 0 {
+		fmt.Printf("Denied commands: %v\n", sc.Security.DenyCommands)
+	}
+	fmt.Printf("Loaded %d tenant(s); AUTH <Name> <Password> for tenant bind\n", tenants.Len())
 	for _, t := range tenants.All() {
-		fmt.Printf("  - %s appId=%d maxmemory=%d strategy=%d policy=%s shards=%d keys≈%d\n",
-			t.Name, t.AppID, t.MaxMemory, int(t.Strategy), t.Policy, t.Shards, t.DB.DBSize())
+		mc := "unlimited"
+		if t.MaxClients > 0 {
+			mc = fmt.Sprintf("%d", t.MaxClients)
+		}
+		fmt.Printf("  - %s appId=%d maxmemory=%d strategy=%d policy=%s shards=%d max_clients=%s keys≈%d\n",
+			t.Name, t.AppID, t.MaxMemory, int(t.Strategy), t.Policy, t.Shards, mc, t.DB.DBSize())
+	}
+	if !requireAuth && defaultTenant != nil {
+		fmt.Printf("Local profile: unauthenticated data commands bind to tenant %q\n", defaultTenant.Name)
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
@@ -85,6 +129,7 @@ func toTenantConfigs(cfgs []TenantConfig) []tenant.Config {
 			ShardCount: sc,
 			Strategy:   st,
 			Policy:     evictionFromConfig(c),
+			MaxClients: c.MaxClients,
 			Disabled:   c.Disabled,
 		})
 	}

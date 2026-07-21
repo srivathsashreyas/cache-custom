@@ -47,8 +47,9 @@ A single Go process speaks **RESP** on TCP and hosts **many tenants**. Each tena
 
 - One goroutine (or equivalent session) per client connection.
 - Connection state includes: authenticated tenant (or unauthenticated), Pub/Sub mode flags, client name/id for ops later.
-- Unauthenticated connections may only run a minimal set (e.g. `AUTH`, `PING`, `QUIT`) once auth is required by config profile; exact enforcement lands with security work.
-- Idle timeouts and max clients (global, later per-tenant) are planned; not required for first RESP bring-up.
+- **Security profiles (M7):** `protected` (default for object config) requires AUTH for all but `AUTH`/`PING`/`ECHO`/`QUIT`/`COMMAND`/`INFO`; `local` may auto-bind the first tenant when `RequireAuth` is false.
+- **TLS** optional via config cert/key paths; optional client CA for mTLS.
+- **Max clients** global and per-tenant (AUTH-bound slots); **idle timeout** optional.
 
 ### Concurrency (v1 requirement)
 

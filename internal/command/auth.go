@@ -23,9 +23,35 @@ func RegisterAuth(r *Registry, tenants *tenant.Registry) {
 			}
 			return protocol.ErrorValue(msg)
 		}
+		// Re-AUTH to same tenant already holding a slot: no-op.
+		if ctx.Tenant == t && ctx.BoundTenant {
+			return protocol.SimpleStringValue("OK")
+		}
+		// Acquire before releasing old so a failed acquire does not drop existing bind.
+		if !t.AcquireConn() {
+			return protocol.ErrorValue("ERR max number of clients reached for tenant")
+		}
+		if ctx.Tenant != nil && ctx.BoundTenant {
+			ctx.Tenant.ReleaseConn()
+		}
+		// Drop pubsub from previous tenant if any.
+		if ctx.PubSub != nil {
+			ctx.PubSub.Close()
+			ctx.PubSub = nil
+		}
 		ctx.Tenant = t
+		ctx.BoundTenant = true
 		return protocol.SimpleStringValue("OK")
 	})
+}
+
+// ReleaseTenantConn frees the AUTH-bound connection slot (call on disconnect).
+func ReleaseTenantConn(ctx *Context) {
+	if ctx == nil || ctx.Tenant == nil || !ctx.BoundTenant {
+		return
+	}
+	ctx.Tenant.ReleaseConn()
+	ctx.BoundTenant = false
 }
 
 // requireDB returns the authenticated tenant store, or a NOAUTH/disabled error value.
