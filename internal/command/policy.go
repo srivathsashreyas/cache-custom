@@ -10,12 +10,13 @@ import (
 
 // Commands allowed without AUTH when RequireAuth is true.
 var unauthenticatedAllow = map[string]struct{}{
-	"AUTH":    {},
-	"PING":    {},
-	"ECHO":    {},
-	"QUIT":    {},
-	"COMMAND": {},
-	"INFO":    {},
+	"AUTH":        {},
+	"PING":        {},
+	"ECHO":        {},
+	"QUIT":        {},
+	"COMMAND":     {},
+	"INFO":        {},
+	"TENANTSTATS": {},
 }
 
 // Policy is server-wide security / command policy (M7).

@@ -6,17 +6,18 @@ Multi-tenant cache server in Go. Goal: **Redis-protocol-compatible** cache with 
 
 Docs: [docs/architecture.md](docs/architecture.md) · [docs/decisions.md](docs/decisions.md) · [plan.md](plan.md)
 
-## Status (M7 — security & connection controls)
+## Status (M8 — observability)
 
 | Working | Later |
 |---------|--------|
 | `AUTH <Name> <Password>` → tenant bind | Full ACL |
-| Per-tenant isolated keyspaces + limits | Observability (M8) |
-| String/TTL + Pub/Sub + persistence modes | GKE (M9) |
+| Per-tenant isolated keyspaces + limits | GKE (M9) |
+| String/TTL + Pub/Sub + persistence modes | |
 | Eviction policies (LRU/LFU/random/FIFO/volatile-*) | |
 | Security profiles (`local` / `protected`), TLS, max clients | |
 | Command denylist (`DenyCommands`) | |
-| `INFO tenants` per-tenant stats | |
+| `INFO` sections + `TENANTSTATS`; Prometheus `/metrics` | |
+| Structured logs (`conn_id`, `tenant`); `/healthz` `/readyz` | |
 
 **Protected profile (default for object configs):** data and Pub/Sub require **`AUTH`**. Unauthenticated allowlist: `AUTH`, `PING`, `ECHO`, `QUIT`, `COMMAND`, `INFO`.  
 **Local profile:** optional open data path via auto-bind to the first tenant (`RequireAuth: false`).  
@@ -141,6 +142,56 @@ Object-form config may include a `Security` section:
 
 Ready-made: `configs/security-local.json`, `configs/security-protected.json`, `config.security.example.json`.
 
+## Observability (M8)
+
+Object-form config may include `Observability`:
+
+```json
+{
+  "Observability": {
+    "MetricsAddr": ":9090",
+    "LogJSON": true,
+    "LogCommands": false
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `MetricsAddr` | HTTP listen for `/metrics`, `/healthz`, `/readyz` (empty = disabled). Flag `-metrics-addr` overrides. |
+| `LogJSON` | JSON structured logs to stdout (`conn_id`, `tenant`, …) |
+| `LogCommands` | Log every command (noisy; off by default) |
+
+### INFO sections
+
+```bash
+redis-cli -p 9001 INFO              # all sections
+redis-cli -p 9001 INFO server
+redis-cli -p 9001 INFO clients
+redis-cli -p 9001 INFO memory
+redis-cli -p 9001 INFO stats
+redis-cli -p 9001 INFO persistence
+redis-cli -p 9001 INFO tenants
+redis-cli -p 9001 TENANTSTATS       # array of per-tenant key/value stats (no AUTH = all; AUTH = current)
+```
+
+### Prometheus & probes
+
+```bash
+./go_cache -addr :9001 -config configs/observability.json
+# or: -metrics-addr :9090
+
+curl -s localhost:9090/metrics | head
+curl -s localhost:9090/healthz    # liveness: process up
+curl -s localhost:9090/readyz     # readiness: RESP accept loop ready
+```
+
+Useful series (global + `{tenant="…"}` labels): `cache_commands_total`, `cache_command_duration_mean_microseconds`, `cache_memory_used_bytes`, `cache_hits_total`, `cache_misses_total`, `cache_hit_ratio`, `cache_evictions_total`, `cache_connections`, `cache_tenant_commands_total`.
+
+**Probe semantics (for M9):** use `/healthz` for liveness and `/readyz` (or RESP `PING`) for readiness so a busy process is not killed solely for load.
+
+Ready-made: `configs/observability.json`.
+
 ### TLS quickstart
 
 ```bash
@@ -159,8 +210,9 @@ redis-cli --tls --insecure -p 9001 AUTH App1 secret1
 go test ./...
 go test ./internal/store -v
 go test ./internal/command -run String -v
-go test ./internal/command -run Policy -v
-go test ./internal/server -run 'TLS|MaxClients|Idle|Protected' -v
+go test ./internal/command -run 'Policy|INFO|TENANT' -v
+go test ./internal/metrics -v
+go test ./internal/server -run 'TLS|MaxClients|Idle|Protected|HTTPOps' -v
 go test ./internal/server -run GoRedis -v
 # go-redis Pub/Sub integration (Subscribe/Publish, PSubscribe, isolation)
 go test ./internal/server -run GoRedisPubSub -v

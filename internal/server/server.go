@@ -7,17 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"cache-custom/internal/command"
+	"cache-custom/internal/metrics"
 	"cache-custom/internal/protocol"
 )
 
-// Options configures connection limits and TLS (M7).
+// Options configures connection limits, TLS (M7), and observability (M8).
 type Options struct {
 	// TLSConfig when non-nil wraps the listener with TLS.
 	TLSConfig *tls.Config
@@ -28,6 +29,12 @@ type Options struct {
 	IdleTimeout time.Duration
 	// ReadTimeout optional per-read deadline; if IdleTimeout is set it takes precedence.
 	ReadTimeout time.Duration
+	// Metrics optional command/connection counters.
+	Metrics *metrics.Collector
+	// Logger structured logger; nil uses slog.Default().
+	Logger *slog.Logger
+	// LogCommands when true, logs each command at Info with tenant and conn id.
+	LogCommands bool
 }
 
 // Server accepts TCP connections and serves RESP commands.
@@ -48,6 +55,10 @@ type Server struct {
 
 	// clientCount is the number of currently open client connections.
 	clientCount int64
+	// connSeq assigns ConnIDs.
+	connSeq atomic.Uint64
+	// ready is set true after Serve starts accepting.
+	ready atomic.Bool
 }
 
 // New creates a server with the given listen address and command registry.
@@ -87,6 +98,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	s.ln = ln
 	s.mu.Unlock()
+	s.ready.Store(true)
+	defer s.ready.Store(false)
 
 	for {
 		conn, err := ln.Accept()
@@ -101,9 +114,13 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 		if !s.tryAddClient(conn) {
 			// Redis-style: refuse when at max clients.
+			s.logger().Warn("max clients reached", "remote", conn.RemoteAddr().String())
 			_ = writeConnError(conn, "ERR max number of clients reached")
 			_ = conn.Close()
 			continue
+		}
+		if s.Opts.Metrics != nil {
+			s.Opts.Metrics.ConnAccepted()
 		}
 		s.track(conn)
 		s.wg.Add(1)
@@ -111,9 +128,24 @@ func (s *Server) Serve(ln net.Listener) error {
 			defer s.wg.Done()
 			defer s.untrack(conn)
 			defer s.releaseClient()
+			if s.Opts.Metrics != nil {
+				defer s.Opts.Metrics.ConnClosed()
+			}
 			s.handleConn(conn)
 		}()
 	}
+}
+
+// Ready reports whether the server is accepting connections (for /readyz).
+func (s *Server) Ready() bool {
+	return s.ready.Load()
+}
+
+func (s *Server) logger() *slog.Logger {
+	if s.Opts.Logger != nil {
+		return s.Opts.Logger
+	}
+	return slog.Default()
 }
 
 // tryAddClient increments the global client count if under MaxClients.
@@ -211,8 +243,27 @@ func (s *Server) handleConn(conn net.Conn) {
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
 	writer := &connWriter{bw: bw}
-	ctx := &command.Context{Writer: writer}
+	connID := s.connSeq.Add(1)
+	remote := conn.RemoteAddr().String()
+	ctx := &command.Context{
+		Writer:     writer,
+		ConnID:     connID,
+		RemoteAddr: remote,
+	}
+	s.logger().Info("connection accepted",
+		"conn_id", connID,
+		"remote", remote,
+	)
 	defer func() {
+		tenantName := ""
+		if ctx.Tenant != nil {
+			tenantName = ctx.Tenant.Name
+		}
+		s.logger().Info("connection closed",
+			"conn_id", connID,
+			"remote", remote,
+			"tenant", tenantName,
+		)
 		if ctx.PubSub != nil {
 			ctx.PubSub.Close()
 		}
@@ -230,13 +281,51 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err != nil {
 			if !isConnClosed(err) {
 				_ = writer.WriteValue(protocol.ErrorValue("ERR protocol error: " + err.Error()))
-				log.Printf("connection %s: %v", conn.RemoteAddr(), err)
+				s.logger().Warn("protocol error",
+					"conn_id", connID,
+					"remote", remote,
+					"err", err.Error(),
+				)
 			}
 			return
 		}
 
+		cmdName := ""
+		if len(args) > 0 {
+			cmdName = args[0]
+		}
+		start := time.Now()
 		ctx.Multi = nil
 		reply := s.Registry.Dispatch(ctx, args)
+		dur := time.Since(start)
+
+		tenantName := ""
+		if ctx.Tenant != nil {
+			tenantName = ctx.Tenant.Name
+		}
+		isErr := reply.Type == protocol.Error
+		if s.Opts.Metrics != nil {
+			s.Opts.Metrics.ObserveCommand(tenantName, cmdName, dur, isErr)
+		}
+		if s.Opts.LogCommands {
+			s.logger().Info("command",
+				"conn_id", connID,
+				"remote", remote,
+				"tenant", tenantName,
+				"cmd", cmdName,
+				"dur_us", dur.Microseconds(),
+				"error", isErr,
+			)
+		} else if isErr && cmdName != "" {
+			// Always log error replies at debug-friendly Warn without full command dump noise for PING.
+			s.logger().Debug("command error",
+				"conn_id", connID,
+				"tenant", tenantName,
+				"cmd", cmdName,
+				"err", reply.Str,
+			)
+		}
+
 		if len(ctx.Multi) > 0 {
 			for _, m := range ctx.Multi {
 				if err := writer.WriteValue(m); err != nil {

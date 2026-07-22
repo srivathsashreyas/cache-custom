@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
-	"fmt"
 	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"cache-custom/internal/command"
+	"cache-custom/internal/metrics"
 	"cache-custom/internal/persist"
 	"cache-custom/internal/server"
 	"cache-custom/internal/store"
@@ -16,12 +22,16 @@ import (
 func main() {
 	addr := flag.String("addr", ":9001", "TCP listen address for RESP")
 	configPath := flag.String("config", "config.json", "path to config file")
+	metricsAddrFlag := flag.String("metrics-addr", "", "HTTP ops listen address (/metrics,/healthz,/readyz); overrides config when set")
 	flag.Parse()
 
 	sc, err := readConfig(*configPath)
 	if err != nil {
 		log.Fatal("Error reading config file:", err)
 	}
+
+	logger := setupLogger(sc.Observability.LogJSON)
+	slog.SetDefault(logger)
 
 	tenants, err := tenant.NewRegistry(toTenantConfigs(sc.Tenants))
 	if err != nil {
@@ -51,6 +61,9 @@ func main() {
 	}
 	pol := command.NewPolicy(requireAuth, defaultTenant, sc.Security.DenyCommands)
 
+	coll := metrics.New()
+	start := coll.StartTime()
+
 	reg := command.NewRegistry()
 	reg.SetPolicy(pol)
 	command.RegisterDefaults(reg, tenants)
@@ -58,6 +71,7 @@ func main() {
 	command.RegisterStringCommands(reg)
 	command.RegisterPubSub(reg)
 	command.RegisterPersist(reg, eng, tenants)
+	command.RegisterTenantStats(reg, tenants, coll)
 
 	tlsCfg, err := loadTLSConfig(sc.Security)
 	if err != nil {
@@ -71,6 +85,9 @@ func main() {
 		TLSConfig:   tlsCfg,
 		MaxClients:  sc.Security.MaxClients,
 		IdleTimeout: idle,
+		Metrics:     coll,
+		Logger:      logger,
+		LogCommands: sc.Observability.LogCommands,
 	}
 	srv := server.NewWithOptions(*addr, reg, opts)
 
@@ -79,30 +96,114 @@ func main() {
 		profile = "protected"
 	}
 	tlsOn := tlsCfg != nil
-	fmt.Printf("Server is listening on %s (RESP2) tls=%v profile=%s require_auth=%v\n",
-		*addr, tlsOn, profile, requireAuth)
-	fmt.Printf("Persistence mode=%s dir=%s\n", eng.Mode(), sc.Persistence.Dir)
+
+	reg.SetRuntime(&command.RuntimeInfo{
+		Tenants:          tenants,
+		PersistMode:      string(eng.Mode()),
+		PersistDir:       sc.Persistence.Dir,
+		AOFFsync:         sc.Persistence.AOFFsync,
+		LastSaveUnix:     eng.LastSaveUnix,
+		ConnectedClients: srv.ClientCount,
+		MaxClients:       sc.Security.MaxClients,
+		Addr:             *addr,
+		StartTime:        start,
+		TLSEnabled:       tlsOn,
+		Profile:          profile,
+		RequireAuth:      requireAuth,
+		Metrics:          coll,
+	})
+
+	metricsAddr := sc.Observability.MetricsAddr
+	if *metricsAddrFlag != "" {
+		metricsAddr = *metricsAddrFlag
+	}
+
+	var httpOps *server.HTTPOps
+	if metricsAddr != "" {
+		httpOps = &server.HTTPOps{
+			Addr:       metricsAddr,
+			Metrics:    coll,
+			Tenants:    tenants,
+			Connected:  srv.ClientCount,
+			MaxClients: sc.Security.MaxClients,
+			// ReadyFunc prefers live RESP accept state.
+			ReadyFunc: srv.Ready,
+		}
+		go func() {
+			logger.Info("http ops listening", "addr", metricsAddr, "paths", "/metrics,/healthz,/readyz")
+			if err := httpOps.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("http ops server failed", "err", err.Error())
+			}
+		}()
+	}
+
+	logger.Info("server starting",
+		"addr", *addr,
+		"tls", tlsOn,
+		"profile", profile,
+		"require_auth", requireAuth,
+		"persist_mode", eng.Mode(),
+		"persist_dir", sc.Persistence.Dir,
+	)
 	if sc.Security.MaxClients > 0 {
-		fmt.Printf("MaxClients global=%d\n", sc.Security.MaxClients)
+		logger.Info("max clients", "global", sc.Security.MaxClients)
 	}
 	if len(sc.Security.DenyCommands) > 0 {
-		fmt.Printf("Denied commands: %v\n", sc.Security.DenyCommands)
+		logger.Info("denied commands", "commands", sc.Security.DenyCommands)
 	}
-	fmt.Printf("Loaded %d tenant(s); AUTH <Name> <Password> for tenant bind\n", tenants.Len())
 	for _, t := range tenants.All() {
-		mc := "unlimited"
+		mc := 0
 		if t.MaxClients > 0 {
-			mc = fmt.Sprintf("%d", t.MaxClients)
+			mc = t.MaxClients
 		}
-		fmt.Printf("  - %s appId=%d maxmemory=%d strategy=%d policy=%s shards=%d max_clients=%s keys≈%d\n",
-			t.Name, t.AppID, t.MaxMemory, int(t.Strategy), t.Policy, t.Shards, mc, t.DB.DBSize())
+		logger.Info("tenant loaded",
+			"tenant", t.Name,
+			"app_id", t.AppID,
+			"max_memory", t.MaxMemory,
+			"strategy", int(t.Strategy),
+			"policy", string(t.Policy),
+			"shards", t.Shards,
+			"max_clients", mc,
+			"keys", t.DB.DBSize(),
+		)
 	}
 	if !requireAuth && defaultTenant != nil {
-		fmt.Printf("Local profile: unauthenticated data commands bind to tenant %q\n", defaultTenant.Name)
+		logger.Info("local profile auto-bind", "tenant", defaultTenant.Name)
 	}
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Fatal(err)
+		}
+	case sig := <-sigCh:
+		logger.Info("shutdown signal", "signal", sig.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if httpOps != nil {
+			_ = httpOps.Shutdown(ctx)
+		}
+		_ = srv.Close()
 	}
+}
+
+func setupLogger(jsonLogs bool) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	var h slog.Handler
+	if jsonLogs {
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h)
 }
 
 func toTenantConfigs(cfgs []TenantConfig) []tenant.Config {

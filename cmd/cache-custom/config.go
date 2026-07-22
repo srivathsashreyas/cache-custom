@@ -62,11 +62,23 @@ type SecurityConfig struct {
 	TLSMinVersion string
 }
 
+// ObservabilityConfig is M8 ops surface (metrics HTTP, logging).
+type ObservabilityConfig struct {
+	// MetricsAddr is the HTTP listen address for /metrics, /healthz, /readyz.
+	// Empty disables the HTTP ops server.
+	MetricsAddr string
+	// LogJSON when true uses JSON slog to stdout (default true for object-form configs left unset? we default false for quiet dev).
+	LogJSON bool
+	// LogCommands when true logs every command with conn_id and tenant.
+	LogCommands bool
+}
+
 // ServerConfig is the on-disk config file (object form).
 type ServerConfig struct {
-	Security    SecurityConfig
-	Persistence PersistConfig
-	Tenants     []TenantConfig
+	Security      SecurityConfig
+	Persistence   PersistConfig
+	Observability ObservabilityConfig
+	Tenants       []TenantConfig
 }
 
 // Config is an alias used by older call sites (tenant only).

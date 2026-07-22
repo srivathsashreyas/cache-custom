@@ -20,6 +20,10 @@ type Context struct {
 	// BoundTenant is true when this connection holds a MaxClients slot via AUTH.
 	// Auto-bound DefaultTenant does not set this (local profile shared default).
 	BoundTenant bool
+	// ConnID is a process-local connection id for structured logs/metrics (M8).
+	ConnID uint64
+	// RemoteAddr is the peer address string (for logs).
+	RemoteAddr string
 	// Writer is set by the server for this connection (command + push replies).
 	Writer Writer
 	// PubSub is created lazily on first SUBSCRIBE/PSUBSCRIBE for the bound tenant.
