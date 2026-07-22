@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -67,8 +67,10 @@ type ObservabilityConfig struct {
 	// MetricsAddr is the HTTP listen address for /metrics, /healthz, /readyz.
 	// Empty disables the HTTP ops server.
 	MetricsAddr string
-	// LogJSON when true uses JSON slog to stdout (default true for object-form configs left unset? we default false for quiet dev).
+	// LogJSON when true uses JSON slog to stdout.
 	LogJSON bool
+	// LogLevel is the minimum level: debug, info, warn, error (default info).
+	LogLevel string
 	// LogCommands when true logs every command with conn_id and tenant.
 	LogCommands bool
 }
@@ -105,7 +107,7 @@ func readConfig(path string) (ServerConfig, error) {
 		if err := validate(sc); err != nil {
 			return ServerConfig{}, err
 		}
-		capTenantMaxClients(&sc)
+		// MaxClients caps applied in main after logger is configured.
 		return sc, nil
 	}
 	var sc ServerConfig
@@ -118,28 +120,47 @@ func readConfig(path string) (ServerConfig, error) {
 	if err := validate(sc); err != nil {
 		return ServerConfig{}, err
 	}
-	capTenantMaxClients(&sc)
 	return sc, nil
 }
 
 // capTenantMaxClients clamps each tenant's MaxClients to Security.MaxClients when the
-// global limit is set and a tenant requests more. Logs a warning so config is not ambiguous.
-// Tenant MaxClients 0 (unlimited) is left unchanged; the global accept limit still applies.
-func capTenantMaxClients(sc *ServerConfig) {
+// global limit is set and a tenant requests more. Returns human-readable warnings
+// (caller should log them). Tenant MaxClients 0 (unlimited) is left unchanged.
+func capTenantMaxClients(sc *ServerConfig) []string {
 	global := sc.Security.MaxClients
 	if global <= 0 {
-		return
+		return nil
 	}
+	var warnings []string
 	for i := range sc.Tenants {
 		t := &sc.Tenants[i]
 		if t.MaxClients <= 0 {
 			continue // unlimited at tenant layer; global still caps TCP accepts
 		}
 		if t.MaxClients > global {
-			log.Printf("warning: tenant %q MaxClients=%d exceeds Security.MaxClients=%d; capping tenant MaxClients to %d (tenant connections cannot exceed the global limit)",
-				t.Name, t.MaxClients, global, global)
+			warnings = append(warnings, fmt.Sprintf(
+				"tenant %q MaxClients=%d exceeds Security.MaxClients=%d; capping tenant MaxClients to %d (tenant connections cannot exceed the global limit)",
+				t.Name, t.MaxClients, global, global,
+			))
 			t.MaxClients = global
 		}
+	}
+	return warnings
+}
+
+// parseLogLevel maps config strings to slog levels. Empty defaults to info.
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("invalid Observability.LogLevel %q (want debug|info|warn|error)", s)
 	}
 }
 
@@ -165,6 +186,9 @@ func validate(sc ServerConfig) error {
 	}
 	if sc.Security.IdleTimeoutSec < 0 {
 		return errors.New("Security.IdleTimeoutSec must be >= 0")
+	}
+	if _, err := parseLogLevel(sc.Observability.LogLevel); err != nil {
+		return err
 	}
 	for i := range sc.Tenants {
 		c := &sc.Tenants[i]

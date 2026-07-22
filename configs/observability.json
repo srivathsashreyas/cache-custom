@@ -9,6 +9,7 @@
   "Observability": {
     "MetricsAddr": ":9090",
     "LogJSON": true,
+    "LogLevel": "info",
     "LogCommands": false
   },
   "Tenants": [

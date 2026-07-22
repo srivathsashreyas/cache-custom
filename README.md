@@ -151,6 +151,7 @@ Object-form config may include `Observability`:
   "Observability": {
     "MetricsAddr": ":9090",
     "LogJSON": true,
+    "LogLevel": "info",
     "LogCommands": false
   }
 }
@@ -160,7 +161,8 @@ Object-form config may include `Observability`:
 |-------|---------|
 | `MetricsAddr` | HTTP listen for `/metrics`, `/healthz`, `/readyz` (empty = disabled). Flag `-metrics-addr` overrides. |
 | `LogJSON` | JSON structured logs to stdout (`conn_id`, `tenant`, …) |
-| `LogCommands` | Log every command (noisy; off by default) |
+| `LogLevel` | Minimum level: `debug`, `info` (default), `warn`, `error`. Use `debug` to surface command-error debug lines. |
+| `LogCommands` | Log every command at info (noisy; off by default) |
 
 ### INFO sections
 

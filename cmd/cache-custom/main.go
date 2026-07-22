@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,28 +24,46 @@ func main() {
 	metricsAddrFlag := flag.String("metrics-addr", "", "HTTP ops listen address (/metrics,/healthz,/readyz); overrides config when set")
 	flag.Parse()
 
+	// Bootstrap logger for config-load failures (before Observability is known).
+	bootstrap := setupLogger(false, slog.LevelInfo)
+	slog.SetDefault(bootstrap)
+
 	sc, err := readConfig(*configPath)
 	if err != nil {
-		log.Fatal("Error reading config file:", err)
+		bootstrap.Error("failed to read config", "path", *configPath, "err", err.Error())
+		os.Exit(1)
 	}
 
-	logger := setupLogger(sc.Observability.LogJSON)
+	level, err := parseLogLevel(sc.Observability.LogLevel)
+	if err != nil {
+		bootstrap.Error("invalid log level", "err", err.Error())
+		os.Exit(1)
+	}
+	logger := setupLogger(sc.Observability.LogJSON, level)
 	slog.SetDefault(logger)
+
+	// Re-apply caps so warnings go through the configured logger (readConfig already capped).
+	for _, w := range capTenantMaxClients(&sc) {
+		logger.Warn(w)
+	}
 
 	tenants, err := tenant.NewRegistry(toTenantConfigs(sc.Tenants))
 	if err != nil {
-		log.Fatal(err)
+		logger.Error("tenant registry", "err", err.Error())
+		os.Exit(1)
 	}
 	defer tenants.Close()
 
 	eng := persist.New(persistConfigFrom(sc.Persistence))
 	if err := eng.Open(); err != nil {
-		log.Fatal("persist open:", err)
+		logger.Error("persist open", "err", err.Error())
+		os.Exit(1)
 	}
 	defer eng.Close()
 
 	if err := eng.Load(tenants); err != nil {
-		log.Fatal("persist load:", err)
+		logger.Error("persist load", "err", err.Error())
+		os.Exit(1)
 	}
 	eng.AttachSinks(tenants)
 	eng.StartPeriodicSnapshots(tenants)
@@ -75,7 +92,8 @@ func main() {
 
 	tlsCfg, err := loadTLSConfig(sc.Security)
 	if err != nil {
-		log.Fatal("tls:", err)
+		logger.Error("tls config", "err", err.Error())
+		os.Exit(1)
 	}
 	var idle time.Duration
 	if sc.Security.IdleTimeoutSec > 0 {
@@ -126,8 +144,7 @@ func main() {
 			Tenants:    tenants,
 			Connected:  srv.ClientCount,
 			MaxClients: sc.Security.MaxClients,
-			// ReadyFunc prefers live RESP accept state.
-			ReadyFunc: srv.Ready,
+			ReadyFunc:  srv.Ready,
 		}
 		go func() {
 			logger.Info("http ops listening", "addr", metricsAddr, "paths", "/metrics,/healthz,/readyz")
@@ -142,6 +159,7 @@ func main() {
 		"tls", tlsOn,
 		"profile", profile,
 		"require_auth", requireAuth,
+		"log_level", level.String(),
 		"persist_mode", eng.Mode(),
 		"persist_dir", sc.Persistence.Dir,
 	)
@@ -182,7 +200,8 @@ func main() {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			log.Fatal(err)
+			logger.Error("server stopped", "err", err.Error())
+			os.Exit(1)
 		}
 	case sig := <-sigCh:
 		logger.Info("shutdown signal", "signal", sig.String())
@@ -195,8 +214,8 @@ func main() {
 	}
 }
 
-func setupLogger(jsonLogs bool) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+func setupLogger(jsonLogs bool, level slog.Level) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: level}
 	var h slog.Handler
 	if jsonLogs {
 		h = slog.NewJSONHandler(os.Stdout, opts)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -131,7 +132,7 @@ func TestCapTenantMaxClientsNoGlobal(t *testing.T) {
 	}
 }
 
-func TestReadConfigCapsTenantMaxClients(t *testing.T) {
+func TestReadConfigThenCapTenantMaxClients(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.json")
 	raw := `{
@@ -145,7 +146,42 @@ func TestReadConfigCapsTenantMaxClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if sc.Tenants[0].MaxClients != 99 {
+		t.Fatalf("before cap want 99, got %d", sc.Tenants[0].MaxClients)
+	}
+	warns := capTenantMaxClients(&sc)
+	if len(warns) != 1 {
+		t.Fatalf("want 1 warning, got %v", warns)
+	}
 	if sc.Tenants[0].MaxClients != 3 {
 		t.Fatalf("want capped 3, got %d", sc.Tenants[0].MaxClients)
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want slog.Level
+		err  bool
+	}{
+		{"", slog.LevelInfo, false},
+		{"debug", slog.LevelDebug, false},
+		{"INFO", slog.LevelInfo, false},
+		{"warn", slog.LevelWarn, false},
+		{"warning", slog.LevelWarn, false},
+		{"error", slog.LevelError, false},
+		{"trace", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := parseLogLevel(tc.in)
+		if tc.err {
+			if err == nil {
+				t.Fatalf("%q: want error", tc.in)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Fatalf("%q: got %v %v want %v", tc.in, got, err, tc.want)
+		}
 	}
 }
