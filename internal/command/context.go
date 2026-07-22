@@ -15,8 +15,15 @@ type Writer interface {
 type Context struct {
 	// Quit is set by handlers that should close the connection after the reply.
 	Quit bool
-	// Tenant is set by AUTH; nil means unauthenticated.
+	// Tenant is set by AUTH (or local-profile default bind); nil means unauthenticated.
 	Tenant *tenant.Tenant
+	// BoundTenant is true when this connection holds a MaxClients slot via AUTH.
+	// Auto-bound DefaultTenant does not set this (local profile shared default).
+	BoundTenant bool
+	// ConnID is a process-local connection id for structured logs/metrics (M8).
+	ConnID uint64
+	// RemoteAddr is the peer address string (for logs).
+	RemoteAddr string
 	// Writer is set by the server for this connection (command + push replies).
 	Writer Writer
 	// PubSub is created lazily on first SUBSCRIBE/PSUBSCRIBE for the bound tenant.

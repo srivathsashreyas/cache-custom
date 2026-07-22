@@ -3,7 +3,6 @@ package command
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -20,11 +19,29 @@ type Registry struct {
 	handlers map[string]Handler
 	// names preserves registration order for COMMAND.
 	names []string
+	// Policy optional security policy (M7); nil = no extra checks beyond handlers.
+	Policy *Policy
+	// Runtime optional live data for INFO (M8).
+	Runtime *RuntimeInfo
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{handlers: make(map[string]Handler)}
+}
+
+// SetPolicy installs a security policy used by Dispatch.
+func (r *Registry) SetPolicy(p *Policy) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Policy = p
+}
+
+// SetRuntime installs live INFO/metrics sources. Safe to call before or after RegisterDefaults.
+func (r *Registry) SetRuntime(rt *RuntimeInfo) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Runtime = rt
 }
 
 // Register adds a command handler. Name is matched case-insensitively.
@@ -56,10 +73,14 @@ func (r *Registry) Dispatch(ctx *Context, args []string) protocol.Value {
 		}
 	}
 	r.mu.RLock()
+	pol := r.Policy
 	h, ok := r.handlers[name]
 	r.mu.RUnlock()
 	if !ok {
 		return protocol.ErrorValue(fmt.Sprintf("ERR unknown command '%s'", args[0]))
+	}
+	if errv := pol.checkPolicy(ctx, name); errv.Type == protocol.Error {
+		return errv
 	}
 	return h(ctx, args)
 }
@@ -75,12 +96,28 @@ func (r *Registry) Names() []string {
 
 // RegisterDefaults registers connectivity / health commands (no data plane).
 // Pass tenants for INFO tenant stats; nil yields server section only.
+// If r.Runtime is set later via SetRuntime, INFO uses the richer RuntimeInfo;
+// until then a RuntimeInfo{Tenants: tenants} is used.
 func RegisterDefaults(r *Registry, tenants *tenant.Registry) {
 	r.Register("PING", ping)
 	r.Register("ECHO", echo)
 	r.Register("QUIT", quit)
 	r.Register("COMMAND", makeCommandHandler(r))
-	r.Register("INFO", makeInfoHandler(tenants))
+	// INFO reads r.Runtime dynamically so SetRuntime after registration still works.
+	r.Register("INFO", func(ctx *Context, args []string) protocol.Value {
+		r.mu.RLock()
+		rt := r.Runtime
+		r.mu.RUnlock()
+		if rt == nil {
+			rt = &RuntimeInfo{Tenants: tenants}
+		} else if rt.Tenants == nil && tenants != nil {
+			// shallow copy so we don't mutate shared Runtime under lock
+			cp := *rt
+			cp.Tenants = tenants
+			rt = &cp
+		}
+		return makeInfoHandler(rt)(ctx, args)
+	})
 }
 
 // ping: no arg → +PONG; one arg → bulk echo of that arg (Redis-compatible).
@@ -143,67 +180,4 @@ func makeCommandHandler(r *Registry) Handler {
 	}
 }
 
-func makeInfoHandler(tenants *tenant.Registry) Handler {
-	return func(ctx *Context, args []string) protocol.Value {
-		if len(args) > 2 {
-			return protocol.ErrorValue("ERR wrong number of arguments for 'info' command")
-		}
-		section := "default"
-		if len(args) == 2 {
-			section = strings.ToLower(args[1])
-		}
 
-		var b strings.Builder
-		writeServer := func() {
-			b.WriteString("# Server\r\n")
-			b.WriteString("redis_mode:standalone\r\n")
-			b.WriteString("tcp_port:9001\r\n")
-			b.WriteString(fmt.Sprintf("go_version:%s\r\n", runtime.Version()))
-			b.WriteString("executable:cache-custom\r\n")
-			b.WriteString("\r\n")
-		}
-		writeTenants := func() {
-			if tenants == nil {
-				return
-			}
-			b.WriteString("# Tenants\r\n")
-			b.WriteString(fmt.Sprintf("tenant_count:%d\r\n", tenants.Len()))
-			for _, t := range tenants.All() {
-				used, max, keys, hits, misses, evictions := t.DB.Stats()
-				status := "active"
-				if t.Status != tenant.StatusActive {
-					status = "disabled"
-				}
-				prefix := "tenant_" + t.Name + "_"
-				b.WriteString(fmt.Sprintf("%sstatus:%s\r\n", prefix, status))
-				b.WriteString(fmt.Sprintf("%sused_memory:%d\r\n", prefix, used))
-				b.WriteString(fmt.Sprintf("%smax_memory:%d\r\n", prefix, max))
-				b.WriteString(fmt.Sprintf("%skeys:%d\r\n", prefix, keys))
-				b.WriteString(fmt.Sprintf("%shits:%d\r\n", prefix, hits))
-				b.WriteString(fmt.Sprintf("%smisses:%d\r\n", prefix, misses))
-				b.WriteString(fmt.Sprintf("%sevictions:%d\r\n", prefix, evictions))
-				b.WriteString(fmt.Sprintf("%sstrategy:%d\r\n", prefix, int(t.Strategy)))
-				b.WriteString(fmt.Sprintf("%seviction_policy:%s\r\n", prefix, t.Policy))
-				b.WriteString(fmt.Sprintf("%sshards:%d\r\n", prefix, t.Shards))
-			}
-			// Bound tenant summary (if any).
-			if ctx != nil && ctx.Tenant != nil {
-				b.WriteString(fmt.Sprintf("current_tenant:%s\r\n", ctx.Tenant.Name))
-			}
-			b.WriteString("\r\n")
-		}
-
-		switch section {
-		case "server":
-			writeServer()
-		case "tenants":
-			writeTenants()
-		case "default", "all":
-			writeServer()
-			writeTenants()
-		default:
-			return protocol.BulkStringValue("")
-		}
-		return protocol.BulkStringValue(b.String())
-	}
-}

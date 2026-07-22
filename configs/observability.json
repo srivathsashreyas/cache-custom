@@ -1,0 +1,39 @@
+{
+  "Security": {
+    "Profile": "protected",
+    "MaxClients": 1000
+  },
+  "Persistence": {
+    "Mode": "none"
+  },
+  "Observability": {
+    "MetricsAddr": ":9090",
+    "LogJSON": true,
+    "LogLevel": "info",
+    "LogCommands": false
+  },
+  "Tenants": [
+    {
+      "Name": "App1",
+      "Password": "secret1",
+      "AppId": 1,
+      "MaxMemory": 1048576,
+      "EvictionPolicy": "allkeys-lru",
+      "MaxTTL": 3600,
+      "ShardCount": 4,
+      "ShardingStrategy": 1,
+      "MaxClients": 100
+    },
+    {
+      "Name": "App2",
+      "Password": "secret2",
+      "AppId": 2,
+      "MaxMemory": 65536,
+      "EvictionPolicy": "allkeys-fifo",
+      "MaxTTL": 3600,
+      "ShardCount": 4,
+      "ShardingStrategy": 2,
+      "MaxClients": 50
+    }
+  ]
+}
