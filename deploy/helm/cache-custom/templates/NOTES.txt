@@ -1,0 +1,16 @@
+cache-custom ({{ .Chart.AppVersion }}) installed as release "{{ .Release.Name }}".
+
+RESP service (in-cluster):
+  {{ include "cache-custom.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+Metrics / health:
+  http://{{ include "cache-custom.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.metricsPort }}/metrics
+  /healthz  /readyz
+
+Test from a debug pod:
+  kubectl -n {{ .Release.Namespace }} run redis-cli --rm -it --restart=Never \
+    --image=redis:7-alpine -- redis-cli -h {{ include "cache-custom.fullname" . }} PING
+
+Or use: deploy/scripts/07-test-gke.sh
+
+Persistence: {{ .Values.persistence.enabled }}

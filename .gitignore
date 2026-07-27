@@ -13,3 +13,7 @@ appendonly.aof
 
 # local TLS material (see config.security.example.json)
 certs/
+
+# deploy env (copy from deploy/.env.example)
+deploy/.env
+.env

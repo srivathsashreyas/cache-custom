@@ -1,0 +1,128 @@
+# Default Helm values for cache-custom on GKE.
+# Override with -f values-prod.yaml or --set key=value.
+# Purpose: keep deploy knobs out of templates so the chart stays readable.
+
+# Number of pods. Keep at 1 when persistence is enabled (shared RWO disk / single-node durability).
+replicaCount: 1
+
+image:
+  # Full image reference without tag, e.g. us-central1-docker.pkg.dev/PROJECT/REPO/cache-custom
+  repository: cache-custom
+  pullPolicy: IfNotPresent
+  # Image tag; CI/scripts set this to git SHA or version.
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# RESP (Redis protocol) service
+service:
+  type: ClusterIP
+  port: 9001
+  # Optional second port for Prometheus + health endpoints.
+  metricsPort: 9090
+
+# Container ports (must match process listen addresses)
+container:
+  respPort: 9001
+  metricsPort: 9090
+
+# Resource requests/limits — required for GKE Autopilot scheduling.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Probes use HTTP health from M8 (Observability.MetricsAddr must be set in server config).
+# Liveness: process up. Readiness: RESP accept loop ready (do not kill on heavy load).
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+# Persistence: when enabled, use a StatefulSet + PVC so identity and disk survive restarts.
+persistence:
+  enabled: false
+  # Directory inside the container (must match Persistence.Dir in server config when enabled).
+  mountPath: /data
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+
+# PodDisruptionBudget: keep at least one pod during voluntary disruptions when replicas > 1.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Server JSON config. Stored in a Secret (contains tenant passwords).
+# MetricsAddr enables /metrics, /healthz, /readyz on the metrics port.
+# When persistence.enabled=true, set Persistence.Mode/Dir to use the PVC at mountPath.
+serverConfig: |
+  {
+    "Security": {
+      "Profile": "protected",
+      "MaxClients": 1000
+    },
+    "Persistence": {
+      "Mode": "none",
+      "Dir": "/data",
+      "AOFFsync": "everysec",
+      "SnapshotIntervalSec": 0
+    },
+    "Observability": {
+      "MetricsAddr": ":9090",
+      "LogJSON": true,
+      "LogLevel": "info",
+      "LogCommands": false
+    },
+    "Tenants": [
+      {
+        "Name": "App1",
+        "Password": "secret1",
+        "AppId": 1,
+        "MaxMemory": 1048576,
+        "EvictionPolicy": "allkeys-lru",
+        "MaxTTL": 3600,
+        "ShardCount": 4,
+        "ShardingStrategy": 1,
+        "MaxClients": 100
+      },
+      {
+        "Name": "App2",
+        "Password": "secret2",
+        "AppId": 2,
+        "MaxMemory": 65536,
+        "EvictionPolicy": "allkeys-fifo",
+        "MaxTTL": 3600,
+        "ShardCount": 4,
+        "ShardingStrategy": 2,
+        "MaxClients": 50
+      }
+    ]
+  }
+
+# Extra labels/annotations
+podAnnotations: {}
+podLabels: {}
+
+# Optional example NetworkPolicy (see templates/networkpolicy.yaml).
+networkPolicy:
+  enabled: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

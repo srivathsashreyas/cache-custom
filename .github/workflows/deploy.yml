@@ -1,0 +1,115 @@
+# Deploy cache-custom to GKE by reusing deploy/scripts (same path as local day-2).
+#
+# Triggers:
+#   - push to master: runs ONLY if repository variable RUN_DEPLOY == 'true'
+#   - workflow_dispatch: always allowed (manual deploy when auto-deploy is off)
+#   - feature branches: never
+#
+# Auth: prefer Workload Identity Federation (vars). SA JSON key (secret GCP_SA_KEY) is
+# fallback — secrets must not appear in `if:` expressions (GitHub rejects that).
+
+name: Deploy GKE
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-gke-master
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Day-2 deploy via scripts
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      vars.RUN_DEPLOY == 'true'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      # Mirrored into deploy/.env so scripts/common.sh load the same knobs as local ops.
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      CLUSTER_NAME: ${{ vars.GKE_CLUSTER }}
+      CLUSTER_TYPE: ${{ vars.GKE_CLUSTER_TYPE || 'autopilot' }}
+      ZONE: ${{ vars.GKE_ZONE }}
+      AR_REPOSITORY: ${{ vars.AR_REPOSITORY || 'cache-custom' }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME || 'cache-custom' }}
+      NAMESPACE: ${{ vars.K8S_NAMESPACE || 'cache-custom' }}
+      HELM_RELEASE: ${{ vars.HELM_RELEASE || 'cache-custom' }}
+      IMAGE_TAG: ${{ github.sha }}
+      PERSISTENCE_ENABLED: ${{ vars.PERSISTENCE_ENABLED || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fail fast if required variables missing
+        run: |
+          missing=0
+          for v in PROJECT_ID REGION CLUSTER_NAME AR_REPOSITORY IMAGE_NAME NAMESPACE HELM_RELEASE; do
+            if [ -z "${!v}" ]; then
+              echo "Missing required variable/env: $v"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Configure repository Variables (see docs/deploy.md)."
+            exit 1
+          fi
+
+      # WIF preferred: set GCP_WORKLOAD_IDENTITY_PROVIDER + GCP_SERVICE_ACCOUNT (repo vars).
+      - name: Authenticate to Google Cloud (WIF)
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      # Fallback: secret GCP_SA_KEY (JSON). Do not reference secrets in `if:` — use WIF empty as gate.
+      - name: Authenticate to Google Cloud (SA key fallback)
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER == '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      - name: Write deploy/.env for scripts
+        run: |
+          # Same file layout operators use locally; scripts source this via common.sh.
+          cat > deploy/.env <<EOF
+          PROJECT_ID=${PROJECT_ID}
+          REGION=${REGION}
+          CLUSTER_NAME=${CLUSTER_NAME}
+          CLUSTER_TYPE=${CLUSTER_TYPE}
+          ZONE=${ZONE}
+          AR_REPOSITORY=${AR_REPOSITORY}
+          IMAGE_NAME=${IMAGE_NAME}
+          IMAGE_TAG=${IMAGE_TAG}
+          NAMESPACE=${NAMESPACE}
+          HELM_RELEASE=${HELM_RELEASE}
+          PERSISTENCE_ENABLED=${PERSISTENCE_ENABLED}
+          HELM_CHART=deploy/helm/cache-custom
+          EOF
+          # Strip leading spaces from heredoc lines if any
+          sed -i 's/^[[:space:]]*//' deploy/.env
+          echo "Wrote deploy/.env (non-secret knobs only)"
+
+      - name: Day-2 deploy (credentials → image → helm → smoke test)
+        run: |
+          chmod +x deploy/scripts/*.sh
+          # day2-deploy.sh: 04-get-credentials, 05-build-push, 06-helm-deploy, 07-test-gke
+          ./deploy/scripts/day2-deploy.sh

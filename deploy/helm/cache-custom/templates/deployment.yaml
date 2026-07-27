@@ -1,0 +1,102 @@
+{{/*
+Deployment used when persistence is disabled (ephemeral cache, free to reschedule).
+Purpose: run N identical pods without stable storage. For durable mode see statefulset.yaml.
+*/}}
+{{- if not .Values.persistence.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cache-custom.fullname" . }}
+  labels:
+    {{- include "cache-custom.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "cache-custom.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Bump checksum so pods roll when serverConfig changes.
+        checksum/config: {{ .Values.serverConfig | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "cache-custom.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # Uses the namespace default ServiceAccount (no custom SA until RBAC/Workload Identity needs it).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cache-custom
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            # RESP listen address and config path (config comes from the Secret volume).
+            - "-addr"
+            - ":{{ .Values.container.respPort }}"
+            - "-config"
+            - "/config/config.json"
+          ports:
+            - name: resp
+              containerPort: {{ .Values.container.respPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.container.metricsPort }}
+              protocol: TCP
+          # Liveness: process is alive (M8 /healthz).
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: metrics
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          # Readiness: accepting work (M8 /readyz) — used for Service endpoints.
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: metrics
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "cache-custom.fullname" . }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

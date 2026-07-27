@@ -1,0 +1,18 @@
+{{/*
+PodDisruptionBudget — limits voluntary disruptions (node drain, upgrades).
+Purpose: keep the cache available during cluster maintenance when replicas > 1.
+With replicaCount=1, minAvailable=1 still documents intent; disruption may block drain until force.
+*/}}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.replicaCount) 0) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "cache-custom.fullname" . }}
+  labels:
+    {{- include "cache-custom.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "cache-custom.selectorLabels" . | nindent 6 }}
+{{- end }}

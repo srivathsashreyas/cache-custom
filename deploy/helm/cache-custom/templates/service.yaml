@@ -1,0 +1,25 @@
+{{/*
+ClusterIP Service for RESP clients and metrics scrapers inside the cluster.
+Purpose: stable DNS name <release>-cache-custom.<namespace>.svc.cluster.local
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cache-custom.fullname" . }}
+  labels:
+    {{- include "cache-custom.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "cache-custom.selectorLabels" . | nindent 4 }}
+  ports:
+    # Redis-compatible RESP protocol
+    - name: resp
+      port: {{ .Values.service.port }}
+      targetPort: resp
+      protocol: TCP
+    # Prometheus /healthz /readyz (M8)
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP

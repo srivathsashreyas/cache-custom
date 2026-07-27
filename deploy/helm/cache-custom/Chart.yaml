@@ -1,0 +1,7 @@
+# Helm chart metadata for the multi-tenant Redis-compatible cache (M9).
+apiVersion: v2
+name: cache-custom
+description: Multi-tenant Redis-protocol cache for GKE
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
