@@ -35,12 +35,36 @@ fi
 log "Pods:"
 kubectl -n "${NAMESPACE}" get pods -l "${LABEL}" -o wide
 
+# Autopilot can take several minutes to schedule one-shot smoke pods (image pull + scale-up).
+wait_pod_succeeded() {
+  local pod="$1"
+  local timeout_s="${2:-300}"
+  local elapsed=0
+  while (( elapsed < timeout_s )); do
+    local phase
+    phase="$(kubectl -n "${NAMESPACE}" get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || echo Missing)"
+    case "${phase}" in
+      Succeeded) return 0 ;;
+      Failed)
+        kubectl -n "${NAMESPACE}" logs "${pod}" || true
+        echo "error: pod ${pod} failed" >&2
+        return 1
+        ;;
+    esac
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  echo "error: timed out waiting for pod ${pod} (last phase=${phase:-unknown})" >&2
+  kubectl -n "${NAMESPACE}" describe pod "${pod}" | tail -30 || true
+  return 1
+}
+
 log "HTTP health via in-cluster curl (metrics port)..."
 # Prefer in-cluster curl over local port-forward (more reliable in CI/non-interactive shells).
 kubectl -n "${NAMESPACE}" delete pod cache-custom-health --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n "${NAMESPACE}" run cache-custom-health --restart=Never --image=curlimages/curl:8.5.0 --command -- \
   sh -c "curl -sf http://${SVC}:${METRICS_PORT}/healthz | grep -q ok && curl -sf http://${SVC}:${METRICS_PORT}/readyz | grep -q ok && echo HEALTH_OK"
-kubectl -n "${NAMESPACE}" wait --for=condition=Succeeded pod/cache-custom-health --timeout=120s
+wait_pod_succeeded cache-custom-health 300
 kubectl -n "${NAMESPACE}" logs cache-custom-health
 kubectl -n "${NAMESPACE}" delete pod cache-custom-health --ignore-not-found >/dev/null 2>&1 || true
 log "healthz/readyz OK"
@@ -56,7 +80,7 @@ kubectl -n "${NAMESPACE}" run cache-custom-smoke --restart=Never --image=redis:7
     redis-cli -h ${SVC} -p ${RESP_PORT} --user App1 --pass secret1 GET m9smoke | grep -q hello
     echo RESP_SMOKE_OK
   "
-kubectl -n "${NAMESPACE}" wait --for=condition=Succeeded pod/cache-custom-smoke --timeout=180s
+wait_pod_succeeded cache-custom-smoke 300
 kubectl -n "${NAMESPACE}" logs cache-custom-smoke
 kubectl -n "${NAMESPACE}" delete pod cache-custom-smoke --ignore-not-found >/dev/null 2>&1 || true
 
