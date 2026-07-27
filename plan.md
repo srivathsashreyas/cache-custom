@@ -330,16 +330,30 @@ Use these as product contracts, not vague goals.
 
 **Deliverables**
 
-- Container image (minimal, non-root, configurable via env/flags/mounted config).
+- Dockerfile and container image (minimal, non-root, configurable via env/flags/mounted config).
 - Helm chart (or Kustomize) with:
   - Deployment and/or StatefulSet (StatefulSet when persistence needs stable identity/volumes)
   - Service (ClusterIP; optional internal TCP)
   - ConfigMap/Secret for config and auth material
   - PVC templates when persistence ≠ `none`
   - Resource requests/limits
-  - Liveness and readiness probes (`PING` or HTTP health)
+  - Liveness and readiness probes (`PING` or HTTP health from M8)
   - PodDisruptionBudget basics
-- Docs: install on GKE (and notes mapping from local k3s/kind experience), expose in-cluster, configure tenants, attach disk, upgrade notes.
+- Deploy env template (`.env.example`) for non-secret knobs (`PROJECT_ID`, region, cluster name, Artifact Registry repo/image, namespace, release name); real `.env` gitignored; no long-lived GCP keys or tenant secrets in git.
+- Separate operator scripts (or make targets), each re-runnable where sensible:
+  - Enable required GCP APIs (e.g. container, artifactregistry)
+  - Create Artifact Registry repository for images
+  - Create GKE cluster (Autopilot or small Standard)
+  - Fetch cluster credentials into kubeconfig
+  - Build image and push to Artifact Registry
+  - Helm install/upgrade the release
+- Deployment documentation (dedicated doc preferred, or README section if small): deploy config, required GitHub Actions variables/secrets, `.env` knobs, how to deploy, and how to test the GKE setup end-to-end.
+- Docs also cover: from-scratch GKE path, existing-cluster path (skip create), in-cluster expose, tenants/config, persistence disk, upgrades; local non-container run remains `go build` / binary as today.
+- GitHub Actions:
+  - Deploy/CD path runs only on merge to `master` (not feature branches).
+  - Auto-deploy is gated by a repository variable (e.g. `RUN_DEPLOY`); when unset or `false`, merge to `master` does not deploy; when `true`, deploy may run automatically.
+  - Deploy job: GCP auth via Workload Identity Federation preferred, GKE credentials, image push as needed, `helm upgrade --install`.
+  - Optional: `workflow_dispatch` for manual deploy when auto-deploy is off.
 - Optional: NetworkPolicy examples.
 
 **Acceptance criteria**
@@ -348,6 +362,12 @@ Use these as product contracts, not vague goals.
 - With persistence enabled + PVC, pod restart restores data.
 - Probes do not incorrectly kill the pod under heavy load (readiness vs liveness split if needed).
 - Single-tenant config path documented for dedicated pods.
+- From-scratch path covers APIs, registry, cluster, credentials, image push, and Helm deploy via env template + scripts.
+- Day-2 path (existing cluster) is credentials + image push + Helm only.
+- GKE setup is tested end-to-end (cluster reachable, release healthy, basic RESP checks such as `PING`/`AUTH`/`SET`/`GET` as applicable).
+- Deployment doc explains config, GitHub variables, `.env`, deploy steps, and how to test.
+- Merge to `master` does not auto-deploy unless `RUN_DEPLOY` (or equivalent) is `true`; feature branches do not trigger deploy CI.
+- Documented Actions deploy path works with non-interactive GCP auth when the gate allows it.
 
 **Depends on:** M1–M3 + M5 (Pub/Sub) minimum for feature-complete image; M6 for meaningful stateful deploy; M7/M8 strongly preferred.
 
@@ -500,7 +520,7 @@ Use these as product contracts, not vague goals.
 | Persistence modes | M6 |
 | Auth/TLS basics | M7 |
 | Metrics + INFO | M8 |
-| GKE Helm/charts | M9 |
+| GKE Helm/charts, deploy scripts, GitHub Actions CI | M9 |
 | Benchmarks + multi-core path | M10 |
 
 **Post-1.0:** M11 (structures) → M12 (HA) → M13 (inter-node) → M14 continuous.  

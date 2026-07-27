@@ -1,0 +1,25 @@
+{{/*
+Optional NetworkPolicy — deny ingress except RESP + metrics from the same namespace.
+Purpose: example lockdown for multi-tenant clusters; disabled by default.
+Enable with: --set networkPolicy.enabled=true
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "cache-custom.fullname" . }}
+  labels:
+    {{- include "cache-custom.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cache-custom.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.container.respPort }}
+        - protocol: TCP
+          port: {{ .Values.container.metricsPort }}
+{{- end }}

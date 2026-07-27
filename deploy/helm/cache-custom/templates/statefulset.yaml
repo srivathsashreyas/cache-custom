@@ -1,0 +1,119 @@
+{{/*
+StatefulSet used when persistence is enabled.
+Purpose: stable pod identity (cache-custom-0) + PVC that survives pod restarts so dump/AOF remain.
+Requires serverConfig Persistence.Mode != none and Dir matching persistence.mountPath.
+replicaCount should remain 1 for single-node durability (no multi-writer disk).
+*/}}
+{{- if .Values.persistence.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cache-custom.fullname" . }}
+  labels:
+    {{- include "cache-custom.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "cache-custom.fullname" . }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "cache-custom.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ .Values.serverConfig | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "cache-custom.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # Uses the namespace default ServiceAccount (no custom SA until RBAC/Workload Identity needs it).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cache-custom
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "-addr"
+            - ":{{ .Values.container.respPort }}"
+            - "-config"
+            - "/config/config.json"
+          ports:
+            - name: resp
+              containerPort: {{ .Values.container.respPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.container.metricsPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: metrics
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: metrics
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            # Durable data (snapshot dump.ccs / AOF) lives here.
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "cache-custom.fullname" . }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  # volumeClaimTemplates: GKE provisions a PersistentDisk per pod ordinal.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "cache-custom.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+{{- end }}

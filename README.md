@@ -6,18 +6,19 @@ Multi-tenant cache server in Go. Goal: **Redis-protocol-compatible** cache with 
 
 Docs: [docs/architecture.md](docs/architecture.md) · [docs/decisions.md](docs/decisions.md) · [plan.md](plan.md)
 
-## Status (M8 — observability)
+## Status (M9 — GKE deployability)
 
 | Working | Later |
 |---------|--------|
 | `AUTH <Name> <Password>` → tenant bind | Full ACL |
-| Per-tenant isolated keyspaces + limits | GKE (M9) |
+| Per-tenant isolated keyspaces + limits | HA / multi-node |
 | String/TTL + Pub/Sub + persistence modes | |
 | Eviction policies (LRU/LFU/random/FIFO/volatile-*) | |
 | Security profiles (`local` / `protected`), TLS, max clients | |
 | Command denylist (`DenyCommands`) | |
 | `INFO` sections + `TENANTSTATS`; Prometheus `/metrics` | |
 | Structured logs (`conn_id`, `tenant`); `/healthz` `/readyz` | |
+| Dockerfile, Helm chart, GKE scripts, gated deploy Actions | |
 
 **Protected profile (default for object configs):** data and Pub/Sub require **`AUTH`**. Unauthenticated allowlist: `AUTH`, `PING`, `ECHO`, `QUIT`, `COMMAND`, `INFO`.  
 **Local profile:** optional open data path via auto-bind to the first tenant (`RequireAuth: false`).  
@@ -33,6 +34,24 @@ go build -o go_cache ./cmd/cache-custom
 ```
 
 Go **1.22+**.
+
+## GKE deploy
+
+See **[docs/deploy.md](docs/deploy.md)** for:
+
+- `deploy/.env` knobs and GitHub Actions variables (`RUN_DEPLOY`, project, cluster, registry)
+- From-scratch vs day-2 scripts under `deploy/scripts/`
+- Helm chart (`deploy/helm/cache-custom`)
+- How to test the GKE setup (`07-test-gke.sh`)
+
+Quick path (after filling `deploy/.env` and `gcloud auth login`):
+
+```bash
+chmod +x deploy/scripts/*.sh
+./deploy/scripts/from-scratch.sh   # or day2-deploy.sh if the cluster already exists
+```
+
+Auto-deploy on merge to `master` runs only when repository variable **`RUN_DEPLOY=true`**.
 
 ## Tenant config (`config.json`)
 

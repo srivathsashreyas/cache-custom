@@ -1,0 +1,12 @@
+# Keep Docker build context small and free of local junk.
+.git
+.gitignore
+go_cache
+data/
+data-*/
+*.ccs
+*.aof
+deploy/.env
+certs/
+.vscode/
+**/*_test.go
