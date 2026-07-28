@@ -21,17 +21,25 @@ fi
 log "Ensuring namespace ${NAMESPACE} exists..."
 kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
 
-# Base --set flags: image + optional persistence.
+# Base --set flags: image always from env (full AR path).
 SET_ARGS=(
   --set "image.repository=${REPO}"
   --set "image.tag=${IMAGE_TAG}"
   --set "image.pullPolicy=IfNotPresent"
 )
 
+# Extra -f values files (e.g. persistence overlay).
+VALUE_FILES=()
+
 if [[ "${PERSISTENCE_ENABLED}" == "true" ]]; then
-  # Enables StatefulSet + PVC; ensure serverConfig Persistence.Mode is not "none" in values.
-  SET_ARGS+=(--set "persistence.enabled=true")
-  log "Persistence enabled (StatefulSet + PVC)."
+  # values-persistence.yaml: StatefulSet+PVC + serverConfig Mode=aof Dir=/data
+  PERSIST_FILE="${CHART_PATH}/values-persistence.yaml"
+  if [[ ! -f "${PERSIST_FILE}" ]]; then
+    echo "error: persistence overlay missing: ${PERSIST_FILE}" >&2
+    exit 1
+  fi
+  VALUE_FILES+=(-f "${PERSIST_FILE}")
+  log "Persistence enabled (StatefulSet + PVC, AOF → /data)."
 fi
 
 # Optional extra sets from env (space-separated key=value pairs).
@@ -46,9 +54,10 @@ log "helm upgrade --install ${HELM_RELEASE} (namespace ${NAMESPACE})..."
 helm upgrade --install "${HELM_RELEASE}" "${CHART_PATH}" \
   --namespace "${NAMESPACE}" \
   --create-namespace \
+  "${VALUE_FILES[@]}" \
   "${SET_ARGS[@]}" \
   --wait \
-  --timeout 5m
+  --timeout 10m
 
 log "Deploy complete."
 kubectl -n "${NAMESPACE}" get pods,svc -l "app.kubernetes.io/instance=${HELM_RELEASE}"

@@ -121,21 +121,15 @@ Skip one-time create scripts; ensure `.env` matches the existing cluster and reg
 
 ### Persistence
 
-1. Set `PERSISTENCE_ENABLED=true` in `.env`, **and**
-2. Override Helm `serverConfig` so `Persistence.Mode` is `snapshot`, `aof`, or `snapshot+aof` and `Dir` is `/data` (see chart `values.yaml`).
-
-Example:
+1. Set `PERSISTENCE_ENABLED=true` in `.env` (or GitHub variable `PERSISTENCE_ENABLED=true` for CI).
+2. `06-helm-deploy.sh` applies `deploy/helm/cache-custom/values-persistence.yaml`:
+   - `persistence.enabled=true` → StatefulSet + PVC
+   - server `Persistence.Mode=aof`, `Dir=/data`, `AOFFsync=always`
+3. `07-test-gke.sh` writes a key, **deletes the cache pod**, waits for restart, confirms the key is still present (PVC restore smoke).
 
 ```bash
-helm upgrade --install cache-custom deploy/helm/cache-custom \
-  --namespace cache-custom \
-  --set image.repository=REGION-docker.pkg.dev/PROJECT/REPO/cache-custom \
-  --set image.tag=latest \
-  --set persistence.enabled=true \
-  --set-file # or use a custom values file with serverConfig Persistence.Mode=snapshot
+PERSISTENCE_ENABLED=true ./deploy/scripts/day2-deploy.sh
 ```
-
-Prefer a small `values-persistence.yaml` for real durable deploys.
 
 ### Single-tenant dedicated pod
 
