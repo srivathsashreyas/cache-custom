@@ -3,9 +3,13 @@
 # Purpose: stop billing for Autopilot/Standard cluster + Artifact Registry storage.
 #
 # Deletes (when present):
-#   1. Helm release + Kubernetes namespace (workloads, Services, Secrets, PVCs)
-#   2. GKE cluster
-#   3. Artifact Registry Docker repository (all images in it)
+#   1. Helm release
+#   2. PVCs in the namespace (and waits for them) — Helm often leaves StatefulSet PVCs
+#   3. Kubernetes namespace
+#   4. Any leftover PVs that referenced this namespace (Released/Available)
+#   5. GKE cluster
+#   6. Artifact Registry Docker repository (all images in it)
+#   7. Best-effort: orphaned GCE PDs matching this cluster name (cost if left behind)
 #
 # Does NOT delete: the GCP project, enabled APIs, or unrelated resources.
 # Re-runnable: missing resources are skipped.
@@ -57,12 +61,32 @@ if command -v kubectl >/dev/null 2>&1 && command -v helm >/dev/null 2>&1; then
       log "Helm release ${HELM_RELEASE} not found; skipping uninstall."
     fi
 
+    # StatefulSet PVCs often survive helm uninstall; delete them explicitly so GCE PDs
+    # are released (default StorageClass reclaimPolicy is usually Delete).
     if kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+      if kubectl -n "${NAMESPACE}" get pvc --no-headers 2>/dev/null | grep -q .; then
+        log "Deleting PVCs in namespace ${NAMESPACE} (releases underlying disks)..."
+        kubectl -n "${NAMESPACE}" delete pvc --all --wait=true --timeout=5m || true
+      else
+        log "No PVCs in ${NAMESPACE}."
+      fi
+
       log "Deleting namespace ${NAMESPACE}..."
       kubectl delete namespace "${NAMESPACE}" --wait=true --timeout=5m || true
     else
       log "Namespace ${NAMESPACE} not found; skipping."
     fi
+
+    # PVs may linger in Released state if reclaim failed; drop ones that claim-bound here.
+    log "Cleaning leftover PVs for namespace ${NAMESPACE} (if any)..."
+    while read -r pv; do
+      [[ -z "${pv}" ]] && continue
+      claim_ns="$(kubectl get pv "${pv}" -o jsonpath='{.spec.claimRef.namespace}' 2>/dev/null || true)"
+      if [[ "${claim_ns}" == "${NAMESPACE}" ]]; then
+        log "  deleting PV ${pv}"
+        kubectl delete pv "${pv}" --wait=true --timeout=2m || true
+      fi
+    done < <(kubectl get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
   else
     log "Could not get cluster credentials (cluster may already be gone); skipping K8s cleanup."
   fi
@@ -111,5 +135,19 @@ else
 fi
 set -e
 
-log "Teardown finished. Cost drivers removed: GKE cluster, AR images/repo, Helm workloads."
+# Best-effort: disks whose name still references this GKE cluster after cluster delete.
+# Dynamic provisioner names often include the cluster name; unused disks still bill.
+log "Scanning for leftover GCE disks matching cluster ${CLUSTER_NAME}..."
+# Unattached disks only (still bill). Names often include the GKE cluster name.
+set +e
+while read -r dname dzone; do
+  [[ -z "${dname}" || -z "${dzone}" ]] && continue
+  log "  deleting unattached disk ${dname} (zone ${dzone})..."
+  gcloud compute disks delete "${dname}" --zone="${dzone}" --project="${PROJECT_ID}" --quiet || true
+done < <(gcloud compute disks list --project="${PROJECT_ID}" \
+  --filter="name~${CLUSTER_NAME} AND NOT users:*" \
+  --format="value(name,zone)" 2>/dev/null)
+set -e
+
+log "Teardown finished. Cost drivers removed: GKE cluster, PVCs/PVs/disks (best-effort), AR images/repo."
 log "Project ${PROJECT_ID} and enabled APIs remain (no ongoing cluster charge)."

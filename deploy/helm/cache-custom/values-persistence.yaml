@@ -1,0 +1,55 @@
+# Overlay for durable single-node deploys (use with: helm -f values.yaml -f values-persistence.yaml).
+# Purpose: StatefulSet + PVC and server config that actually writes to /data.
+#
+# Mode "aof": mutations append as they happen (good for smoke: SET survives pod kill
+# without a separate SAVE). Dir must match persistence.mountPath.
+
+persistence:
+  enabled: true
+  mountPath: /data
+  size: 10Gi
+
+# Full serverConfig override (string field does not deep-merge with base values.yaml).
+serverConfig: |
+  {
+    "Security": {
+      "Profile": "protected",
+      "MaxClients": 1000
+    },
+    "Persistence": {
+      "Mode": "aof",
+      "Dir": "/data",
+      "AOFFsync": "always",
+      "SnapshotIntervalSec": 0
+    },
+    "Observability": {
+      "MetricsAddr": ":9090",
+      "LogJSON": true,
+      "LogLevel": "info",
+      "LogCommands": false
+    },
+    "Tenants": [
+      {
+        "Name": "App1",
+        "Password": "secret1",
+        "AppId": 1,
+        "MaxMemory": 1048576,
+        "EvictionPolicy": "allkeys-lru",
+        "MaxTTL": 3600,
+        "ShardCount": 4,
+        "ShardingStrategy": 1,
+        "MaxClients": 100
+      },
+      {
+        "Name": "App2",
+        "Password": "secret2",
+        "AppId": 2,
+        "MaxMemory": 65536,
+        "EvictionPolicy": "allkeys-fifo",
+        "MaxTTL": 3600,
+        "ShardCount": 4,
+        "ShardingStrategy": 2,
+        "MaxClients": 50
+      }
+    ]
+  }
