@@ -35,6 +35,17 @@ go build -o go_cache ./cmd/cache-custom
 
 Go **1.22+**.
 
+## Benchmarks (M10)
+
+See **[docs/benchmarks.md](docs/benchmarks.md)**.
+
+```bash
+./bench/run-local.sh          # go_cache vs Redis on this machine
+./bench/ci-smoke.sh           # short local smoke
+# after GKE cache-custom is up:
+./bench/run-gke.sh            # Redis co-located on same node + redis-benchmark Job
+```
+
 ## GKE deploy
 
 See **[docs/deploy.md](docs/deploy.md)** for:

@@ -381,19 +381,20 @@ Use these as product contracts, not vague goals.
 
 **Deliverables**
 
-- Benchmark suite (`redis-benchmark` + multi-tenant scenarios + pub/sub if useful).
-- Profiles: CPU, allocations, lock contention across shards.
-- Hardening of intra-node sharding / pipeline path as needed.
-- Published baseline: single-tenant and multi-tenant throughput/latency vs Redis on same machine class.
-- Regression benchmarks in CI (smoke level).
+- Benchmark suite using `redis-benchmark` (and scripts for multi-tenant AUTH where applicable).
+- **Local baseline:** `go_cache` and Redis on the same machine; documented workload matrix (SET/GET, pipelining; multi-tenant load against `go_cache`).
+- **GKE baseline:** `go_cache` and Redis as pods **pinned to the same node** (affinity); in-cluster client runs the same matrix for a fair cloud comparison.
+- Profiles: CPU, allocations, lock contention notes (pprof / documented hot path locks); harden sharding/pipeline only if benchmarks show a clear ceiling.
+- Published baseline numbers in docs (local + GKE same-node).
+- Regression benchmarks at smoke level (script and/or lightweight CI/`workflow_dispatch`).
 
 **Acceptance criteria**
 
-- Documented comparison numbers for a defined workload matrix.
-- No single global mutex on the multi-tenant hot path.
-- Fairness and isolation tests still pass after concurrency changes.
+- Documented comparison numbers for a defined workload matrix (local and GKE same-node).
+- No single global mutex on the multi-tenant data-plane hot path (per-shard locking remains).
+- Fairness and isolation tests still pass after any concurrency changes.
 
-**Depends on:** M2–M4 for meaningful numbers; can start measuring as early as M2.
+**Depends on:** M2–M4 for meaningful numbers; M9 for GKE same-node path.
 
 **Tier progress:** T1 performance track.
 

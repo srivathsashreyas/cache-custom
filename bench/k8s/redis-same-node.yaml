@@ -1,0 +1,65 @@
+# Redis sidecar-style peer for same-node comparison with cache-custom.
+# Purpose: fair GKE A/B — required podAffinity to app.kubernetes.io/name=cache-custom
+# on topologyKey kubernetes.io/hostname so both land on one node.
+#
+# Apply after cache-custom is Running (affinity needs an existing pod to co-locate with).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cache-bench
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-bench
+  namespace: cache-bench
+  labels:
+    app: redis-bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-bench
+  template:
+    metadata:
+      labels:
+        app: redis-bench
+    spec:
+      # Prefer (and effectively require) the same node as cache-custom.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: cache-custom
+              # Same node as cache-custom (default Helm release namespace).
+              topologyKey: kubernetes.io/hostname
+              namespaces:
+                - cache-custom
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["redis-server", "--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-bench
+  namespace: cache-bench
+spec:
+  selector:
+    app: redis-bench
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
