@@ -22,24 +22,20 @@ log "Ensuring namespace ${NAMESPACE} exists..."
 kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
 
 # Base --set flags: image always from env (full AR path).
+# serverConfig in values.yaml already uses Persistence.Mode=aof Dir=/data;
+# persistence.enabled selects StatefulSet+PVC vs Deployment+emptyDir.
 SET_ARGS=(
   --set "image.repository=${REPO}"
   --set "image.tag=${IMAGE_TAG}"
   --set "image.pullPolicy=IfNotPresent"
 )
 
-# Extra -f values files (e.g. persistence overlay).
-VALUE_FILES=()
-
 if [[ "${PERSISTENCE_ENABLED}" == "true" ]]; then
-  # values-persistence.yaml: StatefulSet+PVC + serverConfig Mode=aof Dir=/data
-  PERSIST_FILE="${CHART_PATH}/values-persistence.yaml"
-  if [[ ! -f "${PERSIST_FILE}" ]]; then
-    echo "error: persistence overlay missing: ${PERSIST_FILE}" >&2
-    exit 1
-  fi
-  VALUE_FILES+=(-f "${PERSIST_FILE}")
-  log "Persistence enabled (StatefulSet + PVC, AOF → /data)."
+  SET_ARGS+=(--set "persistence.enabled=true")
+  log "Persistence enabled (StatefulSet + PVC, AOF → /data from values.yaml serverConfig)."
+else
+  SET_ARGS+=(--set "persistence.enabled=false")
+  log "Persistence disabled (Deployment + emptyDir at /data)."
 fi
 
 # Optional extra sets from env (space-separated key=value pairs).
@@ -54,7 +50,6 @@ log "helm upgrade --install ${HELM_RELEASE} (namespace ${NAMESPACE})..."
 helm upgrade --install "${HELM_RELEASE}" "${CHART_PATH}" \
   --namespace "${NAMESPACE}" \
   --create-namespace \
-  "${VALUE_FILES[@]}" \
   "${SET_ARGS[@]}" \
   --wait \
   --timeout 10m

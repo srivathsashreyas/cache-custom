@@ -41,7 +41,7 @@ See **[docs/benchmarks.md](docs/benchmarks.md)**.
 
 ```bash
 ./bench/run-local.sh          # go_cache vs Redis on this machine
-./bench/ci-smoke.sh           # short local smoke
+./bench/run-local.sh --smoke  # shorter local run
 # after GKE cache-custom is up:
 ./bench/run-gke.sh            # Redis co-located on same node + redis-benchmark Job
 ```

@@ -38,7 +38,7 @@ run_workload() {
   echo
   echo "======== workload=${name} target=${host}:${port} requests=${BENCH_REQUESTS} clients=${BENCH_CLIENTS} pipeline=${BENCH_PIPELINE} ========"
 
-  # -t selects tests; -q quieter summary; -n requests; -c clients; -P pipeline; -r keyspace
+  # -t selects tests; -q quieter summary; --csv machine-readable; -n/-c/-P/-r matrix knobs.
   # ${auth_args[@]+...} avoids unbound-variable under `set -u` when no AUTH.
   redis-benchmark -h "${host}" -p "${port}" \
     ${auth_args[@]+"${auth_args[@]}"} \
@@ -48,15 +48,7 @@ run_workload() {
     -r "${BENCH_KEYSPACE}" \
     -t set,get \
     -q \
-    --csv 2>/dev/null || \
-  redis-benchmark -h "${host}" -p "${port}" \
-    ${auth_args[@]+"${auth_args[@]}"} \
-    -n "${BENCH_REQUESTS}" \
-    -c "${BENCH_CLIENTS}" \
-    -P "${BENCH_PIPELINE}" \
-    -r "${BENCH_KEYSPACE}" \
-    -t set,get \
-    -q
+    --csv
 }
 
 # Full matrix for a target (host port [user] [pass])

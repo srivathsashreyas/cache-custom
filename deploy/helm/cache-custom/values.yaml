@@ -1,5 +1,5 @@
 # Default Helm values for cache-custom on GKE.
-# Override with -f values-prod.yaml or --set key=value.
+# Override with --set key=value or a single extra -f file if needed.
 # Purpose: keep deploy knobs out of templates so the chart stays readable.
 
 # Number of pods. Keep at 1 when persistence is enabled (shared RWO disk / single-node durability).
@@ -54,14 +54,51 @@ probes:
     failureThreshold: 3
 
 # Persistence: when enabled, use a StatefulSet + PVC so identity and disk survive restarts.
+# When disabled, Deployment mounts emptyDir at mountPath so serverConfig Dir=/data still works
+# (ephemeral AOF; lost on pod delete). Toggle with --set persistence.enabled=true.
 persistence:
   enabled: false
-  # Directory inside the container (must match Persistence.Dir in server config when enabled).
+  # Directory inside the container (must match Persistence.Dir in serverConfig).
   mountPath: /data
   storageClass: ""
   accessModes:
     - ReadWriteOnce
   size: 10Gi
+
+# Optional GKE same-node benchmark (Redis peer + redis-benchmark Job).
+# Enable only when running ./bench/run-gke.sh (or helm --set benchmark.enabled=true).
+# Affinity uses chart selectorLabels so label changes in this chart stay consistent.
+benchmark:
+  enabled: false
+  # Redis peer co-located with cache-custom pods (required podAffinity on hostname).
+  redis:
+    image: redis:7-alpine
+    port: 6379
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+  # One-shot Job; delete before re-run (Jobs are immutable).
+  job:
+    image: redis:7-alpine
+    requests: 50000
+    clients: 50
+    keyspace: 10000
+    # Must match a tenant in serverConfig (go_cache AUTH).
+    goUser: App1
+    goPass: secret1
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+    ttlSecondsAfterFinished: 600
+    backoffLimit: 1
 
 # PodDisruptionBudget: keep at least one pod during voluntary disruptions when replicas > 1.
 podDisruptionBudget:
@@ -70,7 +107,7 @@ podDisruptionBudget:
 
 # Server JSON config. Stored in a Secret (contains tenant passwords).
 # MetricsAddr enables /metrics, /healthz, /readyz on the metrics port.
-# When persistence.enabled=true, set Persistence.Mode/Dir to use the PVC at mountPath.
+# Persistence.Mode=aof + Dir must match persistence.mountPath (PVC or emptyDir).
 serverConfig: |
   {
     "Security": {
@@ -78,9 +115,9 @@ serverConfig: |
       "MaxClients": 1000
     },
     "Persistence": {
-      "Mode": "none",
+      "Mode": "aof",
       "Dir": "/data",
-      "AOFFsync": "everysec",
+      "AOFFsync": "always",
       "SnapshotIntervalSec": 0
     },
     "Observability": {

@@ -386,7 +386,7 @@ Use these as product contracts, not vague goals.
 - **GKE baseline:** `go_cache` and Redis as pods **pinned to the same node** (affinity); in-cluster client runs the same matrix for a fair cloud comparison.
 - Profiles: CPU, allocations, lock contention notes (pprof / documented hot path locks); harden sharding/pipeline only if benchmarks show a clear ceiling.
 - Published baseline numbers in docs (local + GKE same-node).
-- Regression benchmarks at smoke level (script and/or lightweight CI/`workflow_dispatch`).
+- Optional short local smoke (`./bench/run-local.sh --smoke`); no CI benchmark (runner is not a target environment).
 
 **Acceptance criteria**
 

@@ -78,6 +78,9 @@ spec:
             - name: config
               mountPath: /config
               readOnly: true
+            # Ephemeral data dir so serverConfig Persistence.Dir=/data works without a PVC.
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -87,6 +90,8 @@ spec:
         - name: config
           secret:
             secretName: {{ include "cache-custom.fullname" . }}-config
+        - name: data
+          emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

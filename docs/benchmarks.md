@@ -12,7 +12,7 @@ This document defines how we measure **cache-custom** against **Redis** and wher
 
 | Workload | Tool | Notes |
 |----------|------|--------|
-| SET/GET | `redis-benchmark -t set,get` | Default clients/requests in scripts |
+| SET/GET | `redis-benchmark -t set,get --csv` | Default clients/requests in scripts |
 | Pipelined SET/GET | `-P 16` | Pipeline depth 16 |
 | Multi-tenant (local only) | Sequential runs as `App1` then `App2` | Redis has no multi-tenant AUTH model like ours |
 
@@ -20,19 +20,19 @@ Defaults (override with env):
 
 | Env | Default | Smoke |
 |-----|---------|--------|
-| `BENCH_REQUESTS` | 100000 local / 50000 GKE job | 10000 / 5000 |
+| `BENCH_REQUESTS` | 100000 local / 50000 GKE job | 10000 |
 | `BENCH_CLIENTS` | 50 | 10–20 |
 | `BENCH_KEYSPACE` | 10000 | same |
 
-**Auth:** `go_cache` uses `--user App1 --pass secret1`. Redis local/GKE bench images run **without** AUTH for a clean baseline.
+**Auth:** `go_cache` uses `--user App1 -a secret1` (redis-benchmark ACL flags). Redis local/GKE bench images run **without** AUTH for a clean baseline.
 
 ## Local
 
 ```bash
 # Requires: go, redis-server, redis-benchmark
 ./bench/run-local.sh
-# or smoke:
-./bench/ci-smoke.sh
+# shorter matrix:
+./bench/run-local.sh --smoke
 ```
 
 Starts Redis on `:16379` and `go_cache` on `:19001` with `bench/configs/go-cache-bench.json`, runs the matrix, writes `bench/results/local-*.txt`.
@@ -41,8 +41,13 @@ Starts Redis on `:16379` and `go_cache` on `:19001` with `bench/configs/go-cache
 
 Prerequisites: cluster up, **cache-custom** already deployed and Running (e.g. `./deploy/scripts/from-scratch.sh` or day-2).
 
+Benchmark manifests live in the **Helm chart** (optional; off by default):
+
+- `deploy/helm/cache-custom/templates/bench-redis.yaml` — Redis peer with **required** `podAffinity` to `cache-custom.selectorLabels` on `kubernetes.io/hostname`
+- `deploy/helm/cache-custom/templates/bench-job.yaml` — in-cluster `redis-benchmark` Job
+
 ```bash
-# Pins redis-bench to the node running cache-custom via required podAffinity
+# Pins redis-bench to the node running cache-custom via chart affinity
 ./bench/run-gke.sh
 # smoke:
 ./bench/run-gke.sh --smoke
@@ -51,16 +56,15 @@ Prerequisites: cluster up, **cache-custom** already deployed and Running (e.g. `
 What it does:
 
 1. Confirms a Running `cache-custom` pod and records its `nodeName`.
-2. Applies `bench/k8s/redis-same-node.yaml` (Redis + **required** affinity on `kubernetes.io/hostname` to `app.kubernetes.io/name=cache-custom`).
+2. `helm upgrade --reuse-values --set benchmark.enabled=true` (optional `benchmark.job.requests` for smoke).
 3. Verifies Redis scheduled on the **same node**.
-4. Runs `bench/k8s/bench-job.yaml` (`redis-benchmark` in-cluster against both Services).
-5. Saves logs to `bench/results/gke-*.txt`.
+4. Waits for the Job; saves logs to `bench/results/gke-*.txt`.
 
-Cleanup:
+Cleanup (remove Redis peer + Job from the release):
 
 ```bash
-kubectl delete -f bench/k8s/redis-same-node.yaml
-kubectl -n cache-bench delete job redis-benchmark-job --ignore-not-found
+helm upgrade cache-custom deploy/helm/cache-custom -n cache-custom \
+  --reuse-values --set benchmark.enabled=false
 ```
 
 ## Hot path / locking (no single global data mutex)
@@ -89,7 +93,7 @@ Re-run scripts and paste CSV/summary lines below (or keep timestamped files unde
 
 ### Local (sample smoke on Apple Silicon M1, 2026-07-28)
 
-`./bench/ci-smoke.sh` — 5k requests, 10 clients (illustrative only; re-run full matrix for published numbers).
+`./bench/run-local.sh --smoke` — 5k requests, 10 clients (illustrative only; re-run full matrix for published numbers).
 
 | Target | Workload | SET rps (approx) | GET rps (approx) |
 |--------|----------|------------------|------------------|
@@ -104,10 +108,6 @@ Full runs: `bench/results/local-*.txt` (gitignored; generate locally).
 
 After cluster + `cache-custom` deploy: `./bench/run-gke.sh` → `bench/results/gke-*.txt` (same-node Redis affinity verified in script).
 
-## CI smoke
+## Note on CI
 
-```bash
-./bench/ci-smoke.sh
-```
-
-Optional: `workflow_dispatch` only (not every PR) — see `.github/workflows/bench-smoke.yml`.
+There is **no** CI benchmark job. Runner hardware is not a target environment for the cache; use **local** and **GKE same-node** scripts for meaningful numbers.

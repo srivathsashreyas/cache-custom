@@ -1,0 +1,93 @@
+{{/*
+Optional one-shot redis-benchmark Job against cache-custom Service and redis-bench peer.
+Purpose: in-cluster GKE same-node matrix; hosts/ports and affinity use chart helpers.
+Enabled only when benchmark.enabled=true. Jobs are immutable — delete before re-run.
+*/}}
+{{- if .Values.benchmark.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "cache-custom.fullname" . }}-redis-benchmark
+  labels:
+    {{- include "cache-custom.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis-benchmark
+spec:
+  backoffLimit: {{ .Values.benchmark.job.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.benchmark.job.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "cache-custom.name" . }}-redis-benchmark
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: redis-benchmark
+    spec:
+      restartPolicy: Never
+      # Prefer same node as cache-custom (client placement fairness).
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "cache-custom.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+                namespaces:
+                  - {{ .Release.Namespace | quote }}
+      containers:
+        - name: bench
+          image: {{ .Values.benchmark.job.image | quote }}
+          env:
+            - name: GO_CACHE_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" (include "cache-custom.fullname" .) .Release.Namespace | quote }}
+            - name: GO_CACHE_PORT
+              value: {{ .Values.service.port | quote }}
+            - name: REDIS_HOST
+              value: {{ printf "%s-redis-bench.%s.svc.cluster.local" (include "cache-custom.fullname" .) .Release.Namespace | quote }}
+            - name: REDIS_PORT
+              value: {{ .Values.benchmark.redis.port | quote }}
+            - name: BENCH_REQUESTS
+              value: {{ .Values.benchmark.job.requests | quote }}
+            - name: BENCH_CLIENTS
+              value: {{ .Values.benchmark.job.clients | quote }}
+            - name: BENCH_KEYSPACE
+              value: {{ .Values.benchmark.job.keyspace | quote }}
+            - name: GO_USER
+              value: {{ .Values.benchmark.job.goUser | quote }}
+            - name: GO_PASS
+              value: {{ .Values.benchmark.job.goPass | quote }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== GKE same-node redis-benchmark ==="
+              echo "go_cache=${GO_CACHE_HOST}:${GO_CACHE_PORT}"
+              echo "redis=${REDIS_HOST}:${REDIS_PORT}"
+              echo "requests=${BENCH_REQUESTS} clients=${BENCH_CLIENTS}"
+              # Job may start before redis-bench is Ready; wait for PING.
+              i=0
+              until redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ping 2>/dev/null | grep -q PONG; do
+                i=$((i+1))
+                if [ "$i" -gt 60 ]; then
+                  echo "error: redis-bench not ready" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+              echo
+              echo "===== Redis (no auth) SET/GET ====="
+              redis-benchmark -h "$REDIS_HOST" -p "$REDIS_PORT" -n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -P 1 -r "$BENCH_KEYSPACE" -t set,get -q --csv
+              echo
+              echo "===== Redis pipeline P=16 ====="
+              redis-benchmark -h "$REDIS_HOST" -p "$REDIS_PORT" -n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -P 16 -r "$BENCH_KEYSPACE" -t set,get -q --csv
+              echo
+              echo "===== go_cache AUTH App1 SET/GET ====="
+              redis-benchmark -h "$GO_CACHE_HOST" -p "$GO_CACHE_PORT" --user "$GO_USER" -a "$GO_PASS" -n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -P 1 -r "$BENCH_KEYSPACE" -t set,get -q --csv
+              echo
+              echo "===== go_cache pipeline P=16 ====="
+              redis-benchmark -h "$GO_CACHE_HOST" -p "$GO_CACHE_PORT" --user "$GO_USER" -a "$GO_PASS" -n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -P 16 -r "$BENCH_KEYSPACE" -t set,get -q --csv
+              echo
+              echo "GKE_BENCH_OK"
+          resources:
+            {{- toYaml .Values.benchmark.job.resources | nindent 12 }}
+{{- end }}
