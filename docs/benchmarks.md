@@ -118,19 +118,100 @@ pprof HTTP is not enabled by default; use `go test -cpuprofile` / manual instrum
 
 ## Published baseline numbers
 
-Re-run scripts and paste CSV lines below (or keep timestamped files under `bench/results/`).
+Raw CSV dumps are gitignored under `bench/results/` (`local-*.txt`, `gke-*.txt`). Numbers below are from full matrix runs on **2026-07-31**.
 
-### Local (sample smoke)
+**Shared knobs:** `BENCH_MAX_MEMORY=268435456` (256 MiB), `ShardCount=4`, clients **50**, keyspace **10000**, fair Redis `maxmemory` + `maxmemory-policy` per cell.
 
-`./bench/run-local.sh --smoke` — illustrative only; re-run full matrix for published numbers.
+### Local (Apple Silicon M1, 2026-07-31)
 
-| Target | Cell | Notes |
-|--------|------|--------|
-| Redis | `allkeys-lru` | maxmemory = 256 MiB |
-| go_cache | `s1` / `s2` / `s3` + `allkeys-lru` | same MaxMemory + policy |
+| Field | Value |
+|-------|--------|
+| Host | macOS Darwin arm64 (M1 Air) |
+| Redis | 8.2.0 local `redis-server` |
+| Tool | `redis-benchmark -t set,get --csv` |
+| Requests | **100000** / cell |
+| Run | `./bench/run-local.sh` → `bench/results/local-20260731T063210Z.txt` |
 
-Full runs: `bench/results/local-*.txt` (gitignored).
+#### SET/GET (pipeline=1) — Redis vs go_cache (avg strategies 1–3)
 
-### GKE same-node
+| Policy | Redis SET rps | Redis GET rps | go_cache SET rps (avg s1–s3) | go_cache GET rps (avg s1–s3) | go/redis SET |
+|--------|---------------|---------------|------------------------------|------------------------------|--------------|
+| `noeviction` | 178,253 | 175,131 | 126,450 | 129,217 | **0.71×** |
+| `allkeys-lru` | 183,486 | 178,571 | 130,984 | 136,112 | **0.71×** |
+| `allkeys-lfu` | 184,162 | 188,324 | 131,618 | 129,016 | **0.71×** |
+| `allkeys-random` | 183,824 | 185,529 | 137,370 | 130,752 | **0.75×** |
+| `volatile-lru` | 181,488 | 185,185 | 129,454 | 123,433 | **0.71×** |
+| `volatile-lfu` | 188,324 | 188,324 | 139,622 | 136,194 | **0.74×** |
+| `volatile-random` | 183,486 | 187,970 | 129,950 | 134,101 | **0.71×** |
+| `volatile-ttl` | 185,185 | 186,916 | 136,981 | 135,348 | **0.74×** |
+| `allkeys-fifo` | — (go only) | — | 134,532 | 135,154 | — |
+| `volatile-fifo` | — (go only) | — | 116,366 | 122,856 | — |
 
-After cluster + deploy: `./bench/run-gke.sh` → `bench/results/gke-*.txt`.
+#### SET/GET (pipeline=1) — strategies under `allkeys-lru` (detail)
+
+| Target | Strategy | SET rps | GET rps |
+|--------|----------|---------|---------|
+| Redis | n/a | 183,486 | 178,571 |
+| go_cache | 1 | 124,844 | 139,860 |
+| go_cache | 2 | 133,156 | 139,276 |
+| go_cache | 3 | 134,953 | 129,199 |
+
+#### Pipelined SET/GET (pipeline=16) — averages
+
+| Target | Avg SET rps (all Redis-native cells / all go cells) | Avg GET rps |
+|--------|-----------------------------------------------------|-------------|
+| Redis | ~1.50M | ~2.11M |
+| go_cache | ~513k | ~539k |
+| **go/redis SET** | **~0.34×** | **~0.26×** |
+
+### GKE same-node (Autopilot, 2026-07-31)
+
+| Field | Value |
+|-------|--------|
+| Cluster | GKE Autopilot `cache-custom` / `us-central1` |
+| Node | both pods on `gk3-cache-custom-pool-3-b9dceb90-cddm` (required affinity verified) |
+| go_cache | Helm release (linux/amd64 image), multi-tenant matrix `serverConfig` |
+| Redis | chart `benchmark` peer (`redis:7-alpine`) |
+| Requests | **50000** / cell |
+| Run | `./bench/run-gke.sh` → `bench/results/gke-20260731T065713Z.txt` |
+
+#### SET/GET (pipeline=1) — Redis vs go_cache (avg strategies 1–3)
+
+| Policy | Redis SET rps | Redis GET rps | go_cache SET rps (avg s1–s3) | go_cache GET rps (avg s1–s3) | go/redis SET |
+|--------|---------------|---------------|------------------------------|------------------------------|--------------|
+| `noeviction` | 20,194 | 20,342 | 9,814 | 9,992 | **0.49×** |
+| `allkeys-lru` | 21,413 | 20,517 | 10,028 | 10,078 | **0.47×** |
+| `allkeys-lfu` | 19,654 | 19,794 | 9,857 | 10,081 | **0.50×** |
+| `allkeys-random` | 19,048 | 19,928 | 9,982 | 10,348 | **0.52×** |
+| `volatile-lru` | 20,080 | 21,468 | 10,210 | 10,018 | **0.51×** |
+| `volatile-lfu` | 19,501 | 20,186 | 9,883 | 10,108 | **0.51×** |
+| `volatile-random` | 19,508 | 20,467 | 9,541 | 10,182 | **0.49×** |
+| `volatile-ttl` | 20,568 | 22,056 | 10,254 | 10,369 | **0.50×** |
+| `allkeys-fifo` | — (go only) | — | 9,892 | 10,334 | — |
+| `volatile-fifo` | — (go only) | — | 9,837 | 9,969 | — |
+
+#### SET/GET (pipeline=1) — strategies under `allkeys-lru` (detail)
+
+| Target | Strategy | SET rps | GET rps |
+|--------|----------|---------|---------|
+| Redis | n/a | 21,413 | 20,517 |
+| go_cache | 1 | 9,730 | 10,012 |
+| go_cache | 2 | 10,091 | 10,163 |
+| go_cache | 3 | 10,263 | 10,058 |
+
+#### Pipelined SET/GET (pipeline=16) — averages
+
+| Target | Avg SET rps | Avg GET rps |
+|--------|-------------|-------------|
+| Redis | ~251k | ~257k |
+| go_cache | ~19k | ~20k |
+| **go/redis SET** | **~0.08×** | **~0.08×** |
+
+### Comparison takeaways
+
+- **Local single-op throughput:** go_cache lands at roughly **70–75% of Redis** SET/GET rps under matched `maxmemory` + eviction policy (AUTH multi-tenant path still in the hot path).
+- **Local pipelining:** Redis pulls further ahead (~**3×** SET rps); go_cache still benefits strongly from `-P 16` (~4× its own P1) but does not match Redis’s pipeline efficiency yet.
+- **GKE same-node:** Absolute numbers drop for both (shared node + Autopilot sizing + in-cluster hop). go_cache is about **half of Redis** on plain SET/GET and farther behind on pipeline (~**0.08×**), so cloud pipelining is the clearest gap.
+- **Sharding strategies 1–3:** On this matrix (under limit, no forced eviction pressure) throughput is **similar across strategies**; policy choice also does not dominate when the working set fits in `maxmemory`.
+- **go_cache-only policies** (`allkeys-fifo`, `volatile-fifo`) track the Redis-native policies’ go_cache numbers locally; no Redis baseline for those cells.
+- These are **baseline throughput** numbers, not latency SLOs or multi-tenant fairness under eviction; re-run after hot-path changes and treat ±10% as noise.
