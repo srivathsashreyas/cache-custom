@@ -85,10 +85,12 @@ benchmark:
   redis:
     image: redis:7-alpine
     port: 6379
+    # Keep requests small so Autopilot can co-locate with cache-custom on the PVC/node
+    # (required podAffinity fails when the target node is memory-full).
     resources:
       requests:
-        cpu: 100m
-        memory: 256Mi
+        cpu: 50m
+        memory: 128Mi
       limits:
         cpu: "1"
         memory: 512Mi
@@ -102,8 +104,8 @@ benchmark:
     smoke: "false"
     resources:
       requests:
-        cpu: 200m
-        memory: 256Mi
+        cpu: 100m
+        memory: 128Mi
       limits:
         cpu: "1"
         memory: 512Mi
