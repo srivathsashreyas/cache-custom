@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Local performance baseline: go_cache vs Redis on the same machine.
-# Purpose: M10 apples-to-apples numbers without GKE noise.
+# Purpose: fair A/B — same maxmemory + eviction policy; go_cache × all sharding strategies.
 #
-# Prerequisites: redis-server, redis-benchmark, go toolchain.
+# Prerequisites: redis-server, redis-benchmark, redis-cli, go toolchain.
 # Usage:
-#   ./bench/run-local.sh              # full matrix
-#   BENCH_REQUESTS=10000 ./bench/run-local.sh   # smoke
-#   ./bench/run-local.sh --smoke
+#   ./bench/run-local.sh              # full matrix (all policies × strategies 1–3)
+#   ./bench/run-local.sh --smoke      # allkeys-lru × strategies 1–3 only
+#   BENCH_REQUESTS=10000 ./bench/run-local.sh
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=workloads.sh
 source "${ROOT}/bench/workloads.sh"
+# shellcheck source=matrix.sh
+source "${ROOT}/bench/matrix.sh"
 
 SMOKE=false
 if [[ "${1:-}" == "--smoke" ]]; then
@@ -26,6 +28,7 @@ require_cmd() {
 }
 require_cmd go
 require_cmd redis-server
+require_cmd redis-cli
 
 OUT_DIR="${ROOT}/bench/results"
 mkdir -p "${OUT_DIR}"
@@ -40,7 +43,8 @@ REDIS_PORT=16379
 GO_PID=""
 REDIS_PID=""
 BIN="${ROOT}/bench/.bin/cache-custom"
-mkdir -p "${ROOT}/bench/.bin"
+CFG="${ROOT}/bench/configs/go-cache-bench.generated.json"
+mkdir -p "${ROOT}/bench/.bin" "${ROOT}/bench/configs"
 
 cleanup() {
   [[ -n "${GO_PID}" ]] && kill "${GO_PID}" 2>/dev/null || true
@@ -49,19 +53,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+matrix_select "${SMOKE}"
+gen_go_cache_config "${CFG}"
+echo "Wrote go_cache config: ${CFG}"
+echo "  tenants: $((${#STRATEGIES_TO_RUN[@]} * ${#POLICIES_TO_RUN[@]})) (strategies × policies)"
+
 echo "Building go_cache..."
 go build -o "${BIN}" "${ROOT}/cmd/cache-custom"
 
-echo "Starting Redis on :${REDIS_PORT}..."
-redis-server --port "${REDIS_PORT}" --save "" --appendonly no --daemonize no &
+echo "Starting Redis on :${REDIS_PORT} (maxmemory=${BENCH_MAX_MEMORY})..."
+# Initial policy is overwritten per matrix cell via CONFIG SET.
+redis-server \
+  --port "${REDIS_PORT}" \
+  --save "" \
+  --appendonly no \
+  --maxmemory "${BENCH_MAX_MEMORY}" \
+  --maxmemory-policy allkeys-lru \
+  --daemonize no &
 REDIS_PID=$!
 sleep 0.5
 
 echo "Starting go_cache on :${GO_PORT}..."
-"${BIN}" -addr ":${GO_PORT}" -config "${ROOT}/bench/configs/go-cache-bench.json" &
+"${BIN}" -addr ":${GO_PORT}" -config "${CFG}" &
 GO_PID=$!
-# Wait for PING
-for i in $(seq 1 50); do
+for _ in $(seq 1 50); do
+  if redis-cli -h 127.0.0.1 -p "${GO_PORT}" --user "$(tenant_name "${STRATEGIES_TO_RUN[0]}" "${POLICIES_TO_RUN[0]}")" -a "${BENCH_PASS}" PING 2>/dev/null | grep -q PONG; then
+    break
+  fi
+  # Also accept unauthenticated PING failure; wait for process accept.
   if redis-cli -h 127.0.0.1 -p "${GO_PORT}" PING 2>/dev/null | grep -q PONG; then
     break
   fi
@@ -74,22 +93,12 @@ done
   echo "host=$(hostname)"
   echo "uname=$(uname -a)"
   echo "requests=${BENCH_REQUESTS} clients=${BENCH_CLIENTS} keyspace=${BENCH_KEYSPACE}"
+  echo "fair_baseline=same MaxMemory + EvictionPolicy for Redis and go_cache tenants"
+  echo "go_sharding_strategies=${STRATEGIES_TO_RUN[*]}"
+  echo "config=${CFG}"
   echo
 
-  echo "===== Redis (local :${REDIS_PORT}, no auth) ====="
-  run_matrix 127.0.0.1 "${REDIS_PORT}" "" "" "redis"
-
-  echo
-  echo "===== go_cache (local :${GO_PORT}, AUTH App1/secret1) ====="
-  run_matrix 127.0.0.1 "${GO_PORT}" "App1" "secret1" "go_cache"
-
-  if [[ "${SMOKE}" != "true" ]]; then
-    echo
-    echo "===== go_cache multi-tenant (App1 then App2, sequential SET/GET) ====="
-    BENCH_PIPELINE=1
-    run_workload "go_cache/tenant-App1" 127.0.0.1 "${GO_PORT}" "App1" "secret1"
-    run_workload "go_cache/tenant-App2" 127.0.0.1 "${GO_PORT}" "App2" "secret2"
-  fi
+  run_comparison_matrix 127.0.0.1 "${REDIS_PORT}" 127.0.0.1 "${GO_PORT}"
 } | tee "${OUT_FILE}"
 
 echo

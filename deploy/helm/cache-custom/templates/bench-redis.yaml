@@ -37,7 +37,17 @@ spec:
       containers:
         - name: redis
           image: {{ .Values.benchmark.redis.image | quote }}
-          args: ["redis-server", "--save", "", "--appendonly", "no"]
+          # maxmemory / policy overridden per matrix cell via CONFIG SET in the Job.
+          args:
+            - redis-server
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - {{ .Values.benchmark.matrix.maxMemory | quote }}
+            - --maxmemory-policy
+            - allkeys-lru
           ports:
             - name: redis
               containerPort: {{ .Values.benchmark.redis.port }}

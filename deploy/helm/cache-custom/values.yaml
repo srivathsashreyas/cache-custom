@@ -68,8 +68,19 @@ persistence:
 # Optional GKE same-node benchmark (Redis peer + redis-benchmark Job).
 # Enable only when running ./bench/run-gke.sh (or helm --set benchmark.enabled=true).
 # Affinity uses chart selectorLabels so label changes in this chart stay consistent.
+# Fair matrix: same maxMemory + policy for Redis and go_cache; strategies 1–3 per policy.
+# run-gke.sh generates multi-tenant serverConfig (s{strategy}-{policy} / matrix.password).
 benchmark:
   enabled: false
+  matrix:
+    # Bytes — applied to Redis maxmemory and each go_cache tenant MaxMemory.
+    maxMemory: "268435456"
+    password: benchpass
+    smokePolicy: allkeys-lru
+    # Comma-separated (Job shell splits). Keep in sync with bench/matrix.sh.
+    redisPolicies: "noeviction,allkeys-lru,allkeys-lfu,allkeys-random,volatile-lru,volatile-lfu,volatile-random,volatile-ttl"
+    goOnlyPolicies: "allkeys-fifo,volatile-fifo"
+    strategies: "1,2,3"
   # Redis peer co-located with cache-custom pods (required podAffinity on hostname).
   redis:
     image: redis:7-alpine
@@ -87,9 +98,8 @@ benchmark:
     requests: 50000
     clients: 50
     keyspace: 10000
-    # Must match a tenant in serverConfig (go_cache AUTH).
-    goUser: App1
-    goPass: secret1
+    # true → only smokePolicy × strategies (set by run-gke.sh --smoke).
+    smoke: "false"
     resources:
       requests:
         cpu: 200m

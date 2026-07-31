@@ -21,3 +21,4 @@ deploy/.env
 # local bench binary + raw result dumps (docs summarize published baselines)
 bench/.bin/
 bench/results/
+bench/configs/*.generated.json
