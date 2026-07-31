@@ -114,7 +114,7 @@ spec:
               run_pair() {
                 label="$1"; host="$2"; port="$3"; user="$4"; pass="$5"
                 run_one "${label}/set-get" "$host" "$port" "$user" "$pass" 1
-                run_one "${label}/set-get-pipeline16" "$host" "$port" "$user" "$pass" 16
+                run_one "${label}/pipeline16" "$host" "$port" "$user" "$pass" 16
               }
 
               is_redis_pol() {

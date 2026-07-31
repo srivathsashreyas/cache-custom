@@ -115,7 +115,10 @@ if [[ "${PERSISTENCE_ENABLED:-false}" == "true" || "${HAS_STS}" == "true" ]]; th
     echo PERSIST_WRITE_OK
   "
 
-  POD="$(kubectl -n "${NAMESPACE}" get pod -l "${LABEL}" -o jsonpath='{.items[0].metadata.name}')"
+  # Prefer the main cache workload (exclude optional redis-bench / benchmark Job pods).
+  POD="$(kubectl -n "${NAMESPACE}" get pods -l "${LABEL}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/component}{"\n"}{end}' \
+    | awk -F'\t' '$2 != "redis-bench" && $2 != "redis-benchmark" {print $1; exit}')"
   if [[ -z "${POD}" ]]; then
     echo "error: no cache pod to delete" >&2
     exit 1
@@ -123,8 +126,22 @@ if [[ "${PERSISTENCE_ENABLED:-false}" == "true" || "${HAS_STS}" == "true" ]]; th
   log "Deleting cache pod ${POD} (PVC should retain data)..."
   kubectl -n "${NAMESPACE}" delete pod "${POD}" --wait=true --timeout=120s
 
-  log "Waiting for replacement pod Ready..."
-  kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod -l "${LABEL}" --timeout=300s
+  # StatefulSet recreates the same ordinal name, but there is a brief window with
+  # zero matching pods — `kubectl wait` fails immediately with "no matching resources".
+  log "Waiting for replacement pod ${POD} to reappear and become Ready..."
+  elapsed=0
+  while (( elapsed < 300 )); do
+    if kubectl -n "${NAMESPACE}" get pod "${POD}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  if ! kubectl -n "${NAMESPACE}" get pod "${POD}" >/dev/null 2>&1; then
+    echo "error: timed out waiting for pod ${POD} to be recreated" >&2
+    exit 1
+  fi
+  kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${POD}" --timeout=300s
   kubectl -n "${NAMESPACE}" get pods -l "${LABEL}" -o wide
 
   run_redis_script cache-custom-persist-read "
