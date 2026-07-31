@@ -35,6 +35,17 @@ go build -o go_cache ./cmd/cache-custom
 
 Go **1.22+**.
 
+## Benchmarks (M10)
+
+See **[docs/benchmarks.md](docs/benchmarks.md)**.
+
+```bash
+./bench/run-local.sh          # full matrix: policies × strategies 1–3, fair Redis maxmemory/policy
+./bench/run-local.sh --smoke  # allkeys-lru × strategies 1–3 only
+# after GKE cache-custom is up:
+./bench/run-gke.sh             # same matrix, Redis co-located on same node
+```
+
 ## GKE deploy
 
 See **[docs/deploy.md](docs/deploy.md)** for:

@@ -17,3 +17,8 @@ certs/
 # deploy env (copy from deploy/.env.example)
 deploy/.env
 .env
+
+# local bench binary + raw result dumps (docs summarize published baselines)
+bench/.bin/
+bench/results/
+bench/configs/*.generated.json

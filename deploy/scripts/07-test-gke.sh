@@ -109,7 +109,7 @@ if [[ "${PERSISTENCE_ENABLED:-false}" == "true" || "${HAS_STS}" == "true" ]]; th
   run_redis_script cache-custom-persist-write "
     set -e
     redis-cli -h ${SVC} -p ${RESP_PORT} --user App1 --pass secret1 SET m9persist survived-pod-kill | grep -q OK
-    # Brief pause so AOF always fsync can settle (Mode=aof, AOFFsync=always in values-persistence).
+    # Brief pause so AOF always fsync can settle (Mode=aof, AOFFsync=always in values.yaml serverConfig).
     sleep 1
     redis-cli -h ${SVC} -p ${RESP_PORT} --user App1 --pass secret1 GET m9persist | grep -q survived-pod-kill
     echo PERSIST_WRITE_OK

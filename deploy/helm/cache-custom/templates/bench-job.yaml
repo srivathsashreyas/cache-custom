@@ -1,0 +1,157 @@
+{{/*
+Optional one-shot redis-benchmark Job: fair matrix vs redis-bench peer.
+Purpose: same policy/memory for Redis and each go_cache tenant; all sharding strategies.
+Tenant convention: s{strategy}-{policy} / password from values (must match serverConfig).
+Enabled only when benchmark.enabled=true. Jobs are immutable — delete before re-run.
+*/}}
+{{- if .Values.benchmark.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "cache-custom.fullname" . }}-redis-benchmark
+  labels:
+    {{- include "cache-custom.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis-benchmark
+spec:
+  backoffLimit: {{ .Values.benchmark.job.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.benchmark.job.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "cache-custom.name" . }}-redis-benchmark
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: redis-benchmark
+    spec:
+      restartPolicy: Never
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "cache-custom.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+                namespaces:
+                  - {{ .Release.Namespace | quote }}
+      containers:
+        - name: bench
+          image: {{ .Values.benchmark.job.image | quote }}
+          env:
+            - name: GO_CACHE_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" (include "cache-custom.fullname" .) .Release.Namespace | quote }}
+            - name: GO_CACHE_PORT
+              value: {{ .Values.service.port | quote }}
+            - name: REDIS_HOST
+              value: {{ printf "%s-redis-bench.%s.svc.cluster.local" (include "cache-custom.fullname" .) .Release.Namespace | quote }}
+            - name: REDIS_PORT
+              value: {{ .Values.benchmark.redis.port | quote }}
+            - name: BENCH_REQUESTS
+              value: {{ .Values.benchmark.job.requests | quote }}
+            - name: BENCH_CLIENTS
+              value: {{ .Values.benchmark.job.clients | quote }}
+            - name: BENCH_KEYSPACE
+              value: {{ .Values.benchmark.job.keyspace | quote }}
+            - name: BENCH_MAX_MEMORY
+              value: {{ .Values.benchmark.matrix.maxMemory | quote }}
+            - name: BENCH_PASS
+              value: {{ .Values.benchmark.matrix.password | quote }}
+            - name: BENCH_SMOKE
+              value: {{ .Values.benchmark.job.smoke | quote }}
+            - name: BENCH_SMOKE_POLICY
+              value: {{ .Values.benchmark.matrix.smokePolicy | quote }}
+            - name: BENCH_REDIS_POLICIES
+              value: {{ .Values.benchmark.matrix.redisPolicies | quote }}
+            - name: BENCH_GO_ONLY_POLICIES
+              value: {{ .Values.benchmark.matrix.goOnlyPolicies | quote }}
+            - name: BENCH_STRATEGIES
+              value: {{ .Values.benchmark.matrix.strategies | quote }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== GKE same-node redis-benchmark (fair matrix) ==="
+              echo "go_cache=${GO_CACHE_HOST}:${GO_CACHE_PORT}"
+              echo "redis=${REDIS_HOST}:${REDIS_PORT}"
+              echo "requests=${BENCH_REQUESTS} clients=${BENCH_CLIENTS} max_memory=${BENCH_MAX_MEMORY}"
+              i=0
+              until redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ping 2>/dev/null | grep -q PONG; do
+                i=$((i+1))
+                if [ "$i" -gt 60 ]; then
+                  echo "error: redis-bench not ready" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+
+              # Wait for go_cache (first smoke/full tenant).
+              first_user="s1-${BENCH_SMOKE_POLICY}"
+              i=0
+              until redis-cli -h "$GO_CACHE_HOST" -p "$GO_CACHE_PORT" --user "$first_user" -a "$BENCH_PASS" ping 2>/dev/null | grep -q PONG; do
+                i=$((i+1))
+                if [ "$i" -gt 60 ]; then
+                  echo "error: go_cache tenant ${first_user} not ready" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+
+              run_one() {
+                label="$1"; host="$2"; port="$3"; user="$4"; pass="$5"; pipe="$6"
+                echo
+                echo "======== workload=${label} target=${host}:${port} pipeline=${pipe} ========"
+                if [ -n "$user" ]; then
+                  redis-benchmark -h "$host" -p "$port" --user "$user" -a "$pass" \
+                    -n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -P "$pipe" -r "$BENCH_KEYSPACE" \
+                    -t set,get -q --csv
+                else
+                  redis-benchmark -h "$host" -p "$port" \
+                    -n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -P "$pipe" -r "$BENCH_KEYSPACE" \
+                    -t set,get -q --csv
+                fi
+              }
+
+              run_pair() {
+                label="$1"; host="$2"; port="$3"; user="$4"; pass="$5"
+                run_one "${label}/set-get" "$host" "$port" "$user" "$pass" 1
+                run_one "${label}/set-get-pipeline16" "$host" "$port" "$user" "$pass" 16
+              }
+
+              is_redis_pol() {
+                case ",${BENCH_REDIS_POLICIES}," in
+                  *",$1,"*) return 0 ;;
+                  *) return 1 ;;
+                esac
+              }
+
+              if [ "$BENCH_SMOKE" = "true" ]; then
+                POLICIES="$BENCH_SMOKE_POLICY"
+              else
+                POLICIES=$(echo "$BENCH_REDIS_POLICIES $BENCH_GO_ONLY_POLICIES" | tr ',' ' ')
+              fi
+              STRATS=$(echo "$BENCH_STRATEGIES" | tr ',' ' ')
+
+              for pol in $POLICIES; do
+                echo
+                echo "########## policy=${pol} ##########"
+                if is_redis_pol "$pol"; then
+                  echo "----- Redis maxmemory=${BENCH_MAX_MEMORY} maxmemory-policy=${pol} -----"
+                  redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" CONFIG SET maxmemory "$BENCH_MAX_MEMORY" >/dev/null
+                  redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" CONFIG SET maxmemory-policy "$pol" >/dev/null
+                  redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" FLUSHALL >/dev/null
+                  run_pair "redis/${pol}" "$REDIS_HOST" "$REDIS_PORT" "" ""
+                else
+                  echo "----- Redis: skip (policy ${pol} is go_cache-only) -----"
+                fi
+                for strat in $STRATS; do
+                  user="s${strat}-${pol}"
+                  echo
+                  echo "----- go_cache strategy=${strat} policy=${pol} tenant=${user} -----"
+                  run_pair "go_cache/s${strat}/${pol}" "$GO_CACHE_HOST" "$GO_CACHE_PORT" "$user" "$BENCH_PASS"
+                done
+              done
+              echo
+              echo "GKE_BENCH_OK"
+          resources:
+            {{- toYaml .Values.benchmark.job.resources | nindent 12 }}
+{{- end }}

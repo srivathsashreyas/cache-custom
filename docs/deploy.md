@@ -122,10 +122,11 @@ Skip one-time create scripts; ensure `.env` matches the existing cluster and reg
 ### Persistence
 
 1. Set `PERSISTENCE_ENABLED=true` in `.env` (or GitHub variable `PERSISTENCE_ENABLED=true` for CI).
-2. `06-helm-deploy.sh` applies `deploy/helm/cache-custom/values-persistence.yaml`:
-   - `persistence.enabled=true` → StatefulSet + PVC
-   - server `Persistence.Mode=aof`, `Dir=/data`, `AOFFsync=always`
-3. `07-test-gke.sh` writes a key, **deletes the cache pod**, waits for restart, confirms the key is still present (PVC restore smoke).
+2. `06-helm-deploy.sh` sets `persistence.enabled=true` (single `values.yaml`):
+   - StatefulSet + PVC at `persistence.mountPath` (`/data`)
+   - `serverConfig` already has `Persistence.Mode=aof`, `Dir=/data`, `AOFFsync=always`
+3. When `persistence.enabled=false`, the Deployment mounts **emptyDir** at `/data` (ephemeral AOF).
+4. `07-test-gke.sh` writes a key, **deletes the cache pod**, waits for restart, confirms the key is still present (PVC restore smoke).
 
 ```bash
 PERSISTENCE_ENABLED=true ./deploy/scripts/day2-deploy.sh
@@ -139,9 +140,11 @@ Use a values file with a single entry under `serverConfig.Tenants` and a dedicat
 
 ## Helm chart notes
 
-- **Deployment** when `persistence.enabled=false` (default).
+- **Deployment + emptyDir `/data`** when `persistence.enabled=false` (default).
 - **StatefulSet + PVC** when `persistence.enabled=true`.
-- Config (including passwords) is a **Secret** mounted at `/config/config.json`.
+- Single `values.yaml`: `serverConfig` includes AOF (`Mode=aof`, `Dir=/data`); no separate persistence overlay.
+- Config (including passwords) is a **Secret** mounted at `/config/config.json`. Pod template has `checksum/config` so a config change rolls pods on `helm upgrade`.
+- Optional **benchmark** resources (`benchmark.enabled=true`): Redis same-node peer + `redis-benchmark` Job; affinity uses chart `selectorLabels` (see `docs/benchmarks.md`).
 - Probes: HTTP `metrics` port `/healthz` (liveness) and `/readyz` (readiness).
 - Service: ClusterIP ports `9001` (RESP) and `9090` (metrics).
 - Pods use the namespace **default** ServiceAccount (no custom SA until RBAC is needed).
