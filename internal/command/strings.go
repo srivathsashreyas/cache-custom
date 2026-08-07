@@ -19,7 +19,10 @@ func RegisterStringCommands(r *Registry) {
 		if ten == nil {
 			return errv
 		}
-		val, ok := ten.DB.Get(args[1])
+		val, ok, err := ten.DB.GetString(args[1])
+		if err != nil {
+			return storeErr(err)
+		}
 		if !ok {
 			return protocol.NullValue()
 		}
@@ -60,7 +63,11 @@ func RegisterStringCommands(r *Registry) {
 		}
 		out := make([]protocol.Value, 0, len(args)-1)
 		for _, k := range args[1:] {
-			if v, ok := ten.DB.Get(k); ok {
+			v, ok, err := ten.DB.GetString(k)
+			if err != nil {
+				return storeErr(err)
+			}
+			if ok {
 				out = append(out, protocol.BulkStringValue(v))
 			} else {
 				out = append(out, protocol.NullValue())
