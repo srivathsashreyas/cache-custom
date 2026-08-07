@@ -27,6 +27,11 @@ func (db *DB) Get(key string) (string, bool) {
 		db.misses.Add(1)
 		return "", false
 	}
+	if e.valueType() != TypeString {
+		sh.mu.Unlock()
+		// Wrong type is not a miss; callers that need WRONGTYPE use GetString.
+		return "", false
+	}
 	db.touch(sh, e)
 	val := e.value
 	// Always-on global LRU recency (strategy 1); FIFO global list is insert-only.
@@ -44,6 +49,45 @@ func (db *DB) Get(key string) (string, bool) {
 
 	db.hits.Add(1)
 	return val, true
+}
+
+// GetString is like Get but returns ErrWrongType when the key holds a non-string.
+func (db *DB) GetString(key string) (string, bool, error) {
+	si := db.shardIndex(key)
+	sh := db.shards[si]
+	now := time.Now()
+
+	sh.mu.Lock()
+	e, ok := sh.data[key]
+	if !ok {
+		sh.mu.Unlock()
+		db.misses.Add(1)
+		return "", false, nil
+	}
+	if e.expired(now) {
+		db.removeFromShard(sh, e, false)
+		sh.mu.Unlock()
+		db.clearExpiry(key)
+		db.misses.Add(1)
+		return "", false, nil
+	}
+	if e.valueType() != TypeString {
+		sh.mu.Unlock()
+		return "", false, ErrWrongType
+	}
+	db.touch(sh, e)
+	val := e.value
+	needGlobal := db.cfg.Strategy == StrategyGlobalTrack
+	sh.mu.Unlock()
+	if needGlobal {
+		db.gMu.Lock()
+		if db.stillInGlobal(e) {
+			db.globalTouch(e)
+		}
+		db.gMu.Unlock()
+	}
+	db.hits.Add(1)
+	return val, true, nil
 }
 
 // touch updates all always-on access indexes (shard mu held).
@@ -128,6 +172,18 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 		return false, nil
 	}
 
+	// Redis SET replaces any prior type with a string.
+	if exists && existing.valueType() != TypeString {
+		oldSize := existing.size
+		db.removeFromShard(sh, existing, false)
+		// removeFromShard already adjusted used; clear expiry index for key.
+		sh.mu.Unlock()
+		db.clearExpiry(key)
+		sh.mu.Lock()
+		existing, exists = sh.data[key]
+		_ = oldSize
+	}
+
 	var oldSize uint64
 	if exists {
 		oldSize = existing.size
@@ -178,7 +234,12 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 			db.subUsed(oldSize - newSize)
 		}
 		sh.used = sh.used - oldSize + newSize
+		existing.typ = TypeString
 		existing.value = value
+		existing.hash = nil
+		existing.list = nil
+		existing.set = nil
+		existing.zset = nil
 		existing.size = newSize
 		if !(opt.KeepTTL && !opt.HasExpireAt && opt.EX == 0 && opt.PX == 0) {
 			existing.expiresAt = expiresAt
@@ -203,7 +264,7 @@ func (db *DB) Set(key, value string, opt SetOptions) (bool, error) {
 		return true, nil
 	}
 
-	e := &entry{key: key, value: value, expiresAt: expiresAt, size: newSize, freq: 1, rndIdx: -1}
+	e := &entry{key: key, typ: TypeString, value: value, expiresAt: expiresAt, size: newSize, freq: 1, rndIdx: -1}
 	sh.data[key] = e
 	sh.used += newSize
 	db.addUsed(newSize)
@@ -612,12 +673,26 @@ func (db *DB) PTTL(key string) int64 {
 	return ms
 }
 
-// Type returns "string" or "none".
+// Type returns Redis TYPE name: none|string|hash|list|set|zset.
 func (db *DB) Type(key string) string {
-	if db.Exists(key) == 0 {
+	si := db.shardIndex(key)
+	sh := db.shards[si]
+	now := time.Now()
+	sh.mu.Lock()
+	e, ok := sh.data[key]
+	if !ok {
+		sh.mu.Unlock()
 		return "none"
 	}
-	return "string"
+	if e.expired(now) {
+		db.removeFromShard(sh, e, false)
+		sh.mu.Unlock()
+		db.clearExpiry(key)
+		return "none"
+	}
+	t := e.valueType().String()
+	sh.mu.Unlock()
+	return t
 }
 
 // IncrBy applies delta to the integer-at-key (creates 0 base if missing). Preserves TTL.
@@ -637,6 +712,10 @@ func (db *DB) IncrBy(key string, delta int64) (int64, error) {
 	var cur int64
 	var exp time.Time
 	if ok {
+		if e.valueType() != TypeString {
+			sh.mu.Unlock()
+			return 0, ErrWrongType
+		}
 		var err error
 		cur, err = strconv.ParseInt(e.value, 10, 64)
 		if err != nil {
@@ -646,11 +725,6 @@ func (db *DB) IncrBy(key string, delta int64) (int64, error) {
 		exp = e.expiresAt
 	}
 	sh.mu.Unlock()
-	if !ok {
-		// fall through with cur=0
-	} else {
-		// clearExpiry if we expired above
-	}
 
 	n := cur + delta
 	opt := SetOptions{}
@@ -662,4 +736,43 @@ func (db *DB) IncrBy(key string, delta int64) (int64, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// adjustEntrySize updates memory accounting after in-place structure mutation (sh.mu held).
+func (db *DB) adjustEntrySize(sh *shard, e *entry, newSize uint64) {
+	old := e.size
+	if newSize >= old {
+		db.addUsed(newSize - old)
+	} else {
+		db.subUsed(old - newSize)
+	}
+	if sh.used >= old {
+		sh.used = sh.used - old + newSize
+	} else {
+		sh.used = newSize
+	}
+	e.size = newSize
+}
+
+// insertNewEntry places a brand-new entry into the shard (sh.mu held). Caller must ensureSpace first.
+func (db *DB) insertNewEntry(sh *shard, e *entry) {
+	sh.data[e.key] = e
+	sh.used += e.size
+	db.addUsed(e.size)
+	sh.lruPushTail(e)
+	sh.fifoPushTail(e)
+	sh.rndAdd(e)
+	sh.lfuAdd(e)
+	sh.ttlUpdate(e.key, e.expiresAt)
+}
+
+// afterInsertGlobal links strategy-1 global lists (call after releasing sh.mu if needed).
+func (db *DB) afterInsertGlobal(e *entry) {
+	if db.cfg.Strategy != StrategyGlobalTrack {
+		return
+	}
+	db.gMu.Lock()
+	db.globalPushTail(e)
+	db.globalFifoPushTail(e)
+	db.gMu.Unlock()
 }

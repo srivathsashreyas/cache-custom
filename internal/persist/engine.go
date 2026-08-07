@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -136,12 +137,18 @@ type aofLine struct {
 	Tenant string   `json:"tenant"`
 	Key    string   `json:"key,omitempty"`
 	Value  string   `json:"value,omitempty"`
+	Field  string   `json:"field,omitempty"`
+	Member string   `json:"member,omitempty"`
 	Keys   []string `json:"keys,omitempty"`
+	Args   []string `json:"args,omitempty"`
 	Exp    int64    `json:"exp,omitempty"` // unix nano; 0 = none
 }
 
 func (e *Engine) appendAOF(tenantName string, m store.Mutation) error {
-	line := aofLine{Op: m.Op, Tenant: tenantName, Key: m.Key, Value: m.Value, Keys: m.Keys}
+	line := aofLine{
+		Op: m.Op, Tenant: tenantName, Key: m.Key, Value: m.Value,
+		Field: m.Field, Member: m.Member, Keys: m.Keys, Args: m.Args,
+	}
 	if !m.ExpiresAt.IsZero() {
 		line.Exp = m.ExpiresAt.UnixNano()
 	}
@@ -328,22 +335,21 @@ func (e *Engine) rewriteAOF(reg *tenant.Registry) error {
 	w := bufio.NewWriter(f)
 	for _, t := range reg.All() {
 		for _, r := range t.DB.ExportAll() {
-			line := aofLine{Op: "SET", Tenant: t.Name, Key: r.Key, Value: r.Value}
-			if !r.ExpiresAt.IsZero() {
-				line.Exp = r.ExpiresAt.UnixNano()
-			}
-			b, err := json.Marshal(line)
-			if err != nil {
-				f.Close()
-				os.Remove(tmp)
-				e.abortCatchup()
-				return err
-			}
-			if _, err := w.Write(append(b, '\n')); err != nil {
-				f.Close()
-				os.Remove(tmp)
-				e.abortCatchup()
-				return err
+			lines := recordToAOF(t.Name, r)
+			for _, line := range lines {
+				b, err := json.Marshal(line)
+				if err != nil {
+					f.Close()
+					os.Remove(tmp)
+					e.abortCatchup()
+					return err
+				}
+				if _, err := w.Write(append(b, '\n')); err != nil {
+					f.Close()
+					os.Remove(tmp)
+					e.abortCatchup()
+					return err
+				}
 			}
 		}
 	}
@@ -558,8 +564,105 @@ func applyAOF(db *store.DB, rec aofLine) error {
 	case "FLUSHDB":
 		db.FlushDB()
 		return nil
+	case "HSET", "HINCRBY":
+		_, err := db.HSet(rec.Key, [][2]string{{rec.Field, rec.Value}})
+		return err
+	case "HDEL":
+		_, err := db.HDel(rec.Key, rec.Args)
+		return err
+	case "LPUSH":
+		_, err := db.LPush(rec.Key, rec.Args)
+		return err
+	case "RPUSH":
+		_, err := db.RPush(rec.Key, rec.Args)
+		return err
+	case "LPOP", "RPOP":
+		// full rewrite prefers RPUSH of remaining list; live log of pop is best-effort delete element
+		// For load of incremental AOF after SET-style rewrite, pops are rare; apply by popping once.
+		if rec.Op == "LPOP" {
+			_, _, err := db.LPop(rec.Key)
+			return err
+		}
+		_, _, err := db.RPop(rec.Key)
+		return err
+	case "SADD":
+		_, err := db.SAdd(rec.Key, rec.Args)
+		return err
+	case "SREM":
+		_, err := db.SRem(rec.Key, rec.Args)
+		return err
+	case "ZADD", "ZINCRBY":
+		sc, err := strconv.ParseFloat(rec.Value, 64)
+		if err != nil {
+			return err
+		}
+		_, err = db.ZAdd(rec.Key, []store.ZMember{{Member: rec.Member, Score: sc}})
+		return err
+	case "ZREM":
+		_, err := db.ZRem(rec.Key, rec.Args)
+		return err
 	default:
 		return fmt.Errorf("persist: unknown AOF op %q", rec.Op)
+	}
+}
+
+func recordToAOF(tenant string, r store.Record) []aofLine {
+	exp := int64(0)
+	if !r.ExpiresAt.IsZero() {
+		exp = r.ExpiresAt.UnixNano()
+	}
+	typ := r.Type
+	if typ == "" {
+		typ = "string"
+	}
+	switch typ {
+	case "hash":
+		var lines []aofLine
+		for f, v := range r.Hash {
+			lines = append(lines, aofLine{Op: "HSET", Tenant: tenant, Key: r.Key, Field: f, Value: v, Exp: exp})
+		}
+		if len(lines) == 0 {
+			return nil
+		}
+		// TTL only on first line is wrong for multi-field; apply exp after load via setExpireAt in LoadRecords.
+		// For AOF rewrite, emit EXPIRE after fields.
+		if exp > 0 {
+			lines = append(lines, aofLine{Op: "EXPIRE", Tenant: tenant, Key: r.Key, Exp: exp})
+		}
+		return lines
+	case "list":
+		if len(r.List) == 0 {
+			return nil
+		}
+		lines := []aofLine{{Op: "RPUSH", Tenant: tenant, Key: r.Key, Args: r.List}}
+		if exp > 0 {
+			lines = append(lines, aofLine{Op: "EXPIRE", Tenant: tenant, Key: r.Key, Exp: exp})
+		}
+		return lines
+	case "set":
+		if len(r.Set) == 0 {
+			return nil
+		}
+		lines := []aofLine{{Op: "SADD", Tenant: tenant, Key: r.Key, Args: r.Set}}
+		if exp > 0 {
+			lines = append(lines, aofLine{Op: "EXPIRE", Tenant: tenant, Key: r.Key, Exp: exp})
+		}
+		return lines
+	case "zset":
+		var lines []aofLine
+		for _, zm := range r.ZSet {
+			lines = append(lines, aofLine{
+				Op: "ZADD", Tenant: tenant, Key: r.Key, Member: zm.Member,
+				Value: strconv.FormatFloat(zm.Score, 'f', -1, 64),
+			})
+		}
+		if exp > 0 && len(lines) > 0 {
+			lines = append(lines, aofLine{Op: "EXPIRE", Tenant: tenant, Key: r.Key, Exp: exp})
+		}
+		return lines
+	default:
+		line := aofLine{Op: "SET", Tenant: tenant, Key: r.Key, Value: r.Value, Exp: exp}
+		return []aofLine{line}
 	}
 }
 

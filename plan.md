@@ -402,34 +402,154 @@ Use these as product contracts, not vague goals.
 
 ## Milestone 11 — T2 data structures (incremental)
 
-**Goal:** Mainstream application patterns beyond string cache.
+**Goal:** Mainstream application patterns beyond string cache (T2).
+
+**Compatibility baseline:** Redis Open Source command semantics (RESP2 replies). Command syntax and return shapes follow [redis.io command reference](https://redis.io/docs/latest/commands/). Where Redis has many optional flags, **M11 implements the core form first**; deferred flags are listed per command so scope is explicit.
+
+**Shared rules (all types)**
+
+| Rule | Behavior |
+|------|----------|
+| Missing key | Type-specific: usually empty/null/`0`, not an error (matches Redis). |
+| Wrong type | Reply error containing `WRONGTYPE` if key exists but is not the expected type. |
+| Key TTL | `EXPIRE` / `PEXPIRE` / `TTL` / `PTTL` / `PERSIST` apply to the **whole key** (hash/list/set/zset), not individual fields/members. |
+| Empty after last remove | Deleting the last field/element/member removes the key (like Redis). |
+| Tenancy | All commands are per-AUTH tenant; multi-key set ops only accept keys in the **same tenant**. |
+| Memory | Field/member/value bytes count toward tenant `MaxMemory`; eviction policies apply to these keys. |
+| Persistence | Snapshot + AOF encode all four types; restore round-trip preserves type + content + TTL. |
+| `TYPE` | Returns `hash` / `list` / `set` / `zset` (or `none` if missing). |
+
+---
 
 ### 11a — Hashes
 
-- `HGET`, `HSET`, `HMGET`, `HDEL`, `HGETALL`, `HINCRBY`, `HEXISTS`, memory accounting.
+Map of field → string value at one key. Ref: [Hashes](https://redis.io/docs/latest/develop/data-types/hashes/).
+
+| Command | Syntax (M11) | Reply | Semantics (must match Redis) |
+|---------|----------------|-------|------------------------------|
+| `HSET` | `HSET key field value [field value ...]` | Integer: number of **new** fields added (updates do not count) | Create hash if missing; overwrite existing fields. |
+| `HGET` | `HGET key field` | Bulk string value, or null if key/field missing | O(1) field lookup. |
+| `HMGET` | `HMGET key field [field ...]` | Array of values (null for missing fields); same order as fields | Missing key → array of nulls, not error. |
+| `HDEL` | `HDEL key field [field ...]` | Integer: fields actually removed | Ignore unknown fields; delete key if hash empty. |
+| `HGETALL` | `HGETALL key` | Flat array `[field, value, ...]` (even length); empty array if missing | Field order need not be stable across restarts unless we document otherwise. |
+| `HINCRBY` | `HINCRBY key field increment` | Integer: value after increment | Create key/field as `0` if missing; `increment` is signed 64-bit int; non-integer field value → error; overflow beyond int64 → error. |
+| `HEXISTS` | `HEXISTS key field` | Integer `1` or `0` | `0` if key or field missing. |
+
+**Out of scope for 11a (unless pulled in later):** `HINCRBYFLOAT`, `HSETNX`, `HLEN`, `HKEYS`, `HVALS`, `HSCAN`, `HRANDFIELD`, field-level expire (`HEXPIRE` family).
+
+**11a acceptance**
+
+- Unit + redis-cli/go-redis tests for every row above (happy path, missing key/field, multi-field `HSET`/`HMGET`/`HDEL`, `HINCRBY` create-from-zero and negative delta, `WRONGTYPE` on a string key).
+- After `HDEL` of last field, `EXISTS`/`TYPE` show key gone.
+- Persistence: write hash → restart/reload → `HGETALL` equal; TTL on hash key survives when set.
+- Tenant A cannot see tenant B’s hash at the same key name.
+
+---
 
 ### 11b — Lists
 
-- `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`; blocking pops later if needed.
+Ordered string sequence (left = head, right = tail). Ref: [Lists](https://redis.io/docs/latest/develop/data-types/lists/).
+
+| Command | Syntax (M11) | Reply | Semantics (must match Redis) |
+|---------|----------------|-------|------------------------------|
+| `LPUSH` | `LPUSH key element [element ...]` | Integer: length after push | Create list if missing; left-most arg ends closest to head (same multi-arg order as Redis). |
+| `RPUSH` | `RPUSH key element [element ...]` | Integer: length after push | Create list if missing; multi-arg append order matches Redis. |
+| `LPOP` | `LPOP key` | Bulk string element, or null if empty/missing | Remove and return head. |
+| `RPOP` | `RPOP key` | Bulk string element, or null if empty/missing | Remove and return tail. |
+| `LRANGE` | `LRANGE key start stop` | Array of elements (may be empty) | Inclusive indices; negative indexes from end (`-1` = last); out-of-range clamped like Redis. |
+| `LLEN` | `LLEN key` | Integer length, or `0` if missing | |
+
+**Optional in 11b (implement if cheap; otherwise defer):** `LPOP key count` / `RPOP key count` (Redis ≥6.2 multi-pop → array reply).
+
+**Out of scope for 11b:** blocking pops (`BLPOP`/`BRPOP`/`BLMOVE`), `LINSERT`, `LSET`, `LTRIM`, `LINDEX`, `LMOVE`, `LMPOP`, `LREM`, `LPOS`.
+
+**11b acceptance**
+
+- Tests: multi-arg push order, pop empty → null, `LRANGE` with positive/negative bounds, `LLEN` after mixed push/pop, `WRONGTYPE`.
+- Last pop removes the key.
+- Persistence + TTL round-trip for a non-empty list.
+- Tenant isolation for list keys.
+
+---
 
 ### 11c — Sets
 
-- `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`; inter/union/diff as needed.
+Unordered unique string members. Ref: [Sets](https://redis.io/docs/latest/develop/data-types/sets/).
+
+| Command | Syntax (M11) | Reply | Semantics (must match Redis) |
+|---------|----------------|-------|------------------------------|
+| `SADD` | `SADD key member [member ...]` | Integer: members **newly** added | Create set if missing; duplicates ignored. |
+| `SREM` | `SREM key member [member ...]` | Integer: members actually removed | Delete key if set empty. |
+| `SISMEMBER` | `SISMEMBER key member` | Integer `1` or `0` | `0` if key missing. |
+| `SMEMBERS` | `SMEMBERS key` | Array of all members (empty if missing) | Order not guaranteed. |
+| `SCARD` | `SCARD key` | Integer cardinality, or `0` if missing | |
+
+**Multi-key set algebra (in scope for 11c — previously “as needed”):**
+
+| Command | Syntax (M11) | Reply | Semantics |
+|---------|----------------|-------|-----------|
+| `SINTER` | `SINTER key [key ...]` | Array of intersection | Missing keys treated as empty sets. |
+| `SUNION` | `SUNION key [key ...]` | Array of union | Missing keys treated as empty. |
+| `SDIFF` | `SDIFF key [key ...]` | Array of first-minus-rest | Missing keys treated as empty. |
+
+**Out of scope for 11c:** `SINTERSTORE` / `SUNIONSTORE` / `SDIFFSTORE`, `SMOVE`, `SPOP`, `SRANDMEMBER`, `SSCAN`, `SMISMEMBER`, `SINTERCARD`.
+
+**11c acceptance**
+
+- Tests for add/rem/idempotent add, membership, card, full members dump.
+- `SINTER` / `SUNION` / `SDIFF` with 1–3 keys including a missing key (empty contribution).
+- All keys in multi-key ops must resolve in the **same tenant**; wrong type on any key → `WRONGTYPE`.
+- Persistence + TTL + isolation.
+
+---
 
 ### 11d — Sorted sets
 
-- `ZADD`, `ZRANGE`, `ZRANK`, `ZSCORE`, `ZINCRBY`, `ZREM`; range-by-score as needed.
+Members unique; each has a double score; ordered by score then member. Ref: [Sorted sets](https://redis.io/docs/latest/develop/data-types/sorted-sets/).
 
-**Cross-cutting**
+| Command | Syntax (M11) | Reply | Semantics (must match Redis) |
+|---------|----------------|-------|------------------------------|
+| `ZADD` | `ZADD key score member [score member ...]` | Integer: number of **new** members added | Create zset if missing; existing member’s score is updated (not counted as new). Scores are float64 (string form of double; `+inf`/`-inf` allowed if we accept Redis-compatible parsing). |
+| `ZRANGE` | `ZRANGE key start stop [WITHSCORES]` | Array of members; with `WITHSCORES`, flat `[member, score, ...]` | Rank range, ascending score order; indices like lists (inclusive, negative from end). |
+| `ZRANK` | `ZRANK key member` | Integer rank (0-based, low score first), or null if missing | No `WITHSCORE` required in M11 (Redis 7.2+ option deferred). |
+| `ZSCORE` | `ZSCORE key member` | Bulk string of score, or null if missing | |
+| `ZINCRBY` | `ZINCRBY key increment member` | Bulk string of new score | Create member with score `0` then apply increment if missing; create zset if needed. |
+| `ZREM` | `ZREM key member [member ...]` | Integer: members removed | Delete key if zset empty. |
 
-- `TYPE` / `WRONGTYPE`; TTL on whole key; eviction + persistence include all types; tenant isolation unchanged.
+**Range-by-score (in scope for 11d — previously “as needed”):**
 
-**Acceptance criteria**
+| Command | Syntax (M11) | Reply | Semantics |
+|---------|----------------|-------|-----------|
+| `ZRANGEBYSCORE` | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]` | Array of members (or member/score pairs) | Inclusive `min`/`max` by default; support Redis-style `(1` exclusive bounds and `-inf`/`+inf`. Optional `LIMIT`. (Redis 6.2+ prefers `ZRANGE … BYSCORE`; either form is fine if behavior matches.) |
 
-- Each sub-milestone: client tests + persistence round-trip when persistence exists.
-- Memory accounting remains plausible under mixed types.
+**Out of scope for 11d:** `ZADD` options `NX`/`XX`/`GT`/`LT`/`CH`/`INCR`; `ZREVRANGE` / `ZREVRANK` / `ZREVRANGEBYSCORE`; `ZCOUNT`; `ZREMRANGEBYRANK` / `ZREMRANGEBYSCORE`; `ZMSCORE`; `ZPOPMIN`/`ZPOPMAX`; lex ranges; blocking zset pops; `ZUNION`/`ZINTER` family.
 
-**Depends on:** M2–M6 (persistence should understand encodings before calling T2 “done”).
+**11d acceptance**
+
+- Tests: multi-member `ZADD`, score update does not inflate add count, order by score then member, `ZRANGE`/`WITHSCORES`, `ZRANK`/`ZSCORE` missing → null, `ZINCRBY`, `ZREM`, `ZRANGEBYSCORE` with inclusive/exclusive and `-inf`/`+inf`.
+- Persistence + TTL + isolation + `WRONGTYPE`.
+- Memory: large member sets remain accountable under tenant maxmemory (smoke under eviction optional but recommended).
+
+---
+
+### Cross-cutting deliverables (all of M11)
+
+- Store type tag per key; wire `TYPE` for new types.
+- Command dispatch table / allowlist updated; unknown commands still Redis-style error.
+- AOF/snapshot codecs for hash, list, set, zset (and mix with strings in one tenant).
+- Metrics: optional counters per type (nice-to-have); INFO section may list keys-by-type if cheap.
+- Docs: short command matrix in README or `docs/` — implemented vs deferred options above.
+
+**Milestone-level acceptance criteria**
+
+- **11a–11d each complete** against their tables and sub-acceptance blocks (tests green).
+- **Mixed-type tenant:** one tenant holds string + hash + list + set + zset keys concurrently; isolation and eviction still sane; no cross-type corruption.
+- **Persistence:** with `Mode=aof` or snapshot, kill process / reload; all five kinds round-trip (including empty-vs-missing where Redis distinguishes).
+- **WRONGTYPE matrix:** for each new type command, operating on a key of every other type returns `WRONGTYPE`.
+- **No regression:** existing string/TTL/AUTH/Pub/Sub/`INFO` tests still pass.
+- **Memory:** `INFO memory` / tenant accounting does not go negative or ignore structure payloads under a mixed-type smoke.
+
+**Depends on:** M2–M6 (store + persistence encodings before calling T2 done); M3 tenancy.
 
 **Tier progress:** T2.
 

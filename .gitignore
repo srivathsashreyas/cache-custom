@@ -22,3 +22,6 @@ deploy/.env
 bench/.bin/
 bench/results/
 bench/configs/*.generated.json
+
+# scratch M11 redis-cli smoke scripts (review before committing)
+scripts/m11-*.sh

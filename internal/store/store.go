@@ -1,4 +1,4 @@
-// Package store implements a sharded in-memory string keyspace with TTL and eviction.
+// Package store implements a sharded in-memory keyspace (strings + T2 structures) with TTL and eviction.
 package store
 
 import (
@@ -39,7 +39,7 @@ type Config struct {
 	ExpiryInterval time.Duration  // periodic sweep; default 1s
 }
 
-// DB is a concurrent string store.
+// DB is a concurrent key-value store (strings, hashes, lists, sets, zsets).
 //
 // Concurrency model (no single meta lock on the hot path):
 //   - each shard has its own mu (map + local LRU + shard used)
@@ -55,11 +55,11 @@ type DB struct {
 	used atomic.Uint64
 
 	// Strategy 1: always-on global recency + FIFO lists (not held across shard map ops).
-	gMu        sync.Mutex
-	gHead      *entry
-	gTail      *entry
-	gFifoHead  *entry
-	gFifoTail  *entry
+	gMu       sync.Mutex
+	gHead     *entry
+	gTail     *entry
+	gFifoHead *entry
+	gFifoTail *entry
 
 	expMu  sync.Mutex
 	expH   []expItem
@@ -77,7 +77,12 @@ type DB struct {
 
 type entry struct {
 	key       string
-	value     string
+	typ       ValueType // TypeString (0) default
+	value     string    // TypeString
+	hash      map[string]string
+	list      []string
+	set       map[string]struct{}
+	zset      *zsetData
 	expiresAt time.Time // zero => no expiry
 	size      uint64
 	freq      int // LFU frequency (unbounded); always updated on access
@@ -176,7 +181,7 @@ func (db *DB) shardIndex(key string) int {
 }
 
 func memSize(key, value string) uint64 {
-	return uint64(len(key)) + uint64(len(value)) + EntryOverhead
+	return memSizeString(key, value)
 }
 
 // Stats returns used memory, max memory, keys, hits, misses, evictions.
